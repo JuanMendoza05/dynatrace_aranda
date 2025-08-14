@@ -1,0 +1,12 @@
+---
+- name: Listar servicios en ejecución
+  hosts: linux_servers
+  become: yes
+  tasks:
+    - name: Obtener servicios activos
+      command: systemctl list-units --type=service --state=running
+      register: running_services
+
+    - name: Mostrar servicios en ejecución
+      debug:
+        msg: "{{ running_services.stdout_lines }}"
