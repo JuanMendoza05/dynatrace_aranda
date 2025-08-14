@@ -1,0 +1,129 @@
+---
+- name: Crear ticket en Aranda desde datos de Dynatrace
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # Variables extraídas del webhook payload de Dynatrace (configuradas en AWX Job Template)
+    # Estas variables deben ser configuradas en AWX usando tower_webhook_payload
+    dynatrace_problem_title: "{{ dynatrace_problem_title | default('Problema detectado por Dynatrace') }}"
+    dynatrace_problem_details: "{{ dynatrace_problem_details | default('') }}"
+    dynatrace_problem_url: "{{ dynatrace_problem_url | default('') }}"
+    dynatrace_state: "{{ dynatrace_state | default('OPEN') }}"
+    dynatrace_problem_id: "{{ dynatrace_problem_id | default('') }}"
+    
+    # Variables de Zabbix extraídas del webhook payload
+    zabbix_host: "{{ zabbix_host | default('') }}"
+    zabbix_severity: "{{ zabbix_severity | default('Information') }}"
+    zabbix_trigger: "{{ zabbix_trigger | default(dynatrace_problem_title) }}"
+    zabbix_date: "{{ zabbix_date | default('') }}"
+    zabbix_time: "{{ zabbix_time | default('') }}"
+
+  tasks:
+    - name: Validar variables requeridas
+      fail:
+        msg: "La variable {{ item }} es requerida"
+      when: vars[item] is undefined or vars[item] == ""
+      loop:
+        - aranda_base_url
+        - vault_aranda_api_token
+
+    - name: Construir timestamp desde datos de Zabbix
+      set_fact:
+        timestamp: "{{ zabbix_date }} {{ zabbix_time }}"
+      when: zabbix_date != "" and zabbix_time != ""
+
+    - name: Usar timestamp actual si no se proporciona desde Zabbix
+      set_fact:
+        timestamp: "{{ ansible_date_time.date }} {{ ansible_date_time.time }}"
+      when: timestamp is undefined
+
+    - name: Construir descripción del ticket
+      set_fact:
+        ticket_description: |
+          INCIDENT AUTO-DETECTADO
+
+          Detalles:
+          {% if zabbix_host != "" %}- Host: {{ zabbix_host }}
+          {% endif %}- Fuente: Zabbix
+          {% if zabbix_severity != "" %}- Severidad: {{ zabbix_severity }}
+          {% endif %}- Trigger: {{ zabbix_trigger }}
+          - Timestamp: {{ timestamp }}
+
+          Auto-remediación iniciada automáticamente
+
+    - name: Obtener configuración de severidad
+      set_fact:
+        severity_config: "{{ severity_mapping[zabbix_severity] | default(severity_mapping.default) }}"
+
+    - name: Construir payload para Aranda
+      set_fact:
+        aranda_payload:
+          subject: "[AUTO] {{ dynatrace_problem_title }}"
+          description: "{{ ticket_description }}"
+          applicantId: "{{ default_config.applicant_id }}"
+          categoryId: "{{ default_config.category_id }}"
+          companyId: "{{ default_config.company_id }}"
+          consoleType: "{{ default_config.console_type }}"
+          customerId: "{{ default_config.customer_id }}"
+          groupId: "{{ default_config.group_id }}"
+          impactId: "{{ severity_config.impact_id }}"
+          itemType: "{{ default_config.item_type }}"
+          locationId: "{{ default_config.location_id }}"
+          modelId: "{{ default_config.model_id }}"
+          priorityId: "{{ severity_config.priority_id }}"
+          projectId: "{{ default_config.project_id }}"
+          responsibleId: "{{ default_config.responsible_id }}"
+          serviceId: "{{ default_config.service_id }}"
+          stateId: "{{ default_config.state_id }}"
+          urgencyId: "{{ severity_config.urgency_id }}"
+          authorId: "{{ default_config.author_id }}"
+          tempItemId: "{{ default_config.temp_item_id }}"
+          listAdditionalField: []
+          registryTypeId: "{{ default_config.registry_type_id }}"
+
+    - name: Mostrar payload que se enviará a Aranda
+      debug:
+        var: aranda_payload
+        verbosity: 1
+
+    - name: Crear ticket en Aranda
+      uri:
+        url: "{{ aranda_base_url }}/api/v9/item/"
+        method: POST
+        headers:
+          Content-Type: "application/json"
+          x-authorization: "Bearer {{ vault_aranda_api_token }}"
+          User-Agent: "Ansible/AWX-DynatraceIntegration"
+          Accept: "*/*"
+          Accept-Encoding: "gzip, deflate, br"
+          Connection: "keep-alive"
+          x-aranda-tenant-alias: "{{ aranda_tenant_alias | default(omit) }}"
+        body_format: json
+        body: "{{ aranda_payload }}"
+        validate_certs: false
+        timeout: 30
+        status_code: [200, 201]
+      register: aranda_response
+
+    - name: Mostrar respuesta de Aranda
+      debug:
+        msg: |
+          Ticket creado exitosamente:
+          - ID: {{ aranda_response.json.id }}
+          - Número: {{ aranda_response.json.idByProject }}
+          - Título: {{ dynatrace_problem_title }}
+
+    - name: Guardar información del ticket creado
+      set_fact:
+        created_ticket:
+          aranda_case_id: "{{ aranda_response.json.id }}"
+          aranda_case_number: "{{ aranda_response.json.idByProject }}"
+          dynatrace_problem: "{{ dynatrace_problem_title }}"
+          timestamp: "{{ ansible_date_time.iso8601 }}"
+          success: true
+
+    - name: Exportar resultado para otros playbooks
+      set_stats:
+        data:
+          aranda_ticket_created: "{{ created_ticket }}"

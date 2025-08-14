@@ -1,0 +1,50 @@
+# Configuración de Aranda API (estas deben ser configuradas en AWX)
+# aranda_base_url: "https://your-aranda-instance.com/asmsapi"  # Configurar en AWX Job Template
+# vault_aranda_api_token: "{{ vault('aranda_api_token') }}"    # Configurar en AWX Job Template  
+# aranda_tenant_alias: ""  # Configurar en AWX Job Template si aplica
+
+# Configuración por defecto para tickets
+default_config:
+  applicant_id: 19230
+  category_id: 197
+  company_id: 1
+  console_type: "specialist"
+  customer_id: 19230
+  group_id: 283
+  item_type: 1  # Incidente
+  location_id: 1
+  model_id: 33
+  project_id: 4
+  responsible_id: 19292
+  service_id: 33
+  state_id: 254
+  author_id: 19230
+  temp_item_id: -1
+  registry_type_id: 1651
+
+# Mapeo de severidades Zabbix a configuración Aranda
+severity_mapping:
+  "Information":
+    impact_id: 1
+    urgency_id: 4
+    priority_id: 6
+  "Warning":
+    impact_id: 2
+    urgency_id: 5
+    priority_id: 8
+  "Average":
+    impact_id: 2
+    urgency_id: 5
+    priority_id: 8
+  "High":
+    impact_id: 2
+    urgency_id: 5
+    priority_id: 8
+  "Disaster":
+    impact_id: 3
+    urgency_id: 6
+    priority_id: 10
+  "default":
+    impact_id: 1
+    urgency_id: 4
+    priority_id: 6

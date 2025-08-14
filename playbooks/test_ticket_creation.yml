@@ -1,0 +1,31 @@
+---
+- name: Test - Crear ticket de prueba en Aranda
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    # Datos de prueba simulando webhook de Dynatrace
+    dynatrace_problem_title: "Windows: High CPU utilization"
+    dynatrace_problem_details: "CPU utilization is above 80% for 5 minutes"
+    dynatrace_problem_url: "https://test.dynatrace.com/problem/TEST-001"
+    dynatrace_state: "OPEN"
+    dynatrace_problem_id: "TEST-001"
+    
+    # Datos de Zabbix simulados
+    zabbix_host: "SRVTERMINAL01"
+    zabbix_severity: "Warning"
+    zabbix_trigger: "Windows: High CPU utilization"
+    zabbix_date: "2025.08.07"
+    zabbix_time: "13:54:42"
+
+  tasks:
+    - name: Incluir playbook principal de creación de tickets
+      include: create_aranda_ticket.yml
+
+    - name: Mostrar resultado final
+      debug:
+        msg: |
+          ✅ Ticket de prueba creado exitosamente:
+          - ID en Aranda: {{ created_ticket.aranda_case_id }}
+          - Número de caso: {{ created_ticket.aranda_case_number }}
+          - Problema de Dynatrace: {{ created_ticket.dynatrace_problem }}
