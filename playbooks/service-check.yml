@@ -1,0 +1,299 @@
+---
+- name: "Verificación automática de servicios - Dynatrace Problem Handler"
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: yes
+  vars:
+    # Variables pasadas desde el webhook
+    dynatrace_problem_id: "{{ dynatrace_problem_id | default('UNKNOWN') }}"
+    dynatrace_problem_title: "{{ dynatrace_problem_title | default('Sin título') }}"
+    dynatrace_problem_details: "{{ dynatrace_problem_details | default('Sin detalles') }}"
+    dynatrace_state: "{{ dynatrace_state | default('UNKNOWN') }}"
+    dynatrace_impact_level: "{{ dynatrace_impact_level | default('UNKNOWN') }}"
+    aranda_case_id: "{{ aranda_case_id | default('') }}"
+    aranda_case_number: "{{ aranda_case_number | default('') }}"
+    affected_hosts: "{{ affected_hosts | default([]) }}"
+    affected_services: "{{ affected_services | default([]) }}"
+    webhook_timestamp: "{{ webhook_timestamp | default('') }}"
+    
+    # Configuración de verificación de servicios
+    common_services:
+      - httpd
+      - apache2
+      - nginx
+      - mysql
+      - postgresql
+      - redis
+      - elasticsearch
+      - docker
+      - kubelet
+    
+    service_ports:
+      httpd: 80
+      apache2: 80
+      nginx: 80
+      mysql: 3306
+      postgresql: 5432
+      redis: 6379
+      elasticsearch: 9200
+      docker: 2375
+      kubelet: 10250
+
+  tasks:
+    - name: "Mostrar información del problema de servicios"
+      debug:
+        msg: |
+          ==============================================
+          PROBLEMA DE SERVICIOS DETECTADO
+          ==============================================
+          ID del Problema: {{ dynatrace_problem_id }}
+          Título: {{ dynatrace_problem_title }}
+          Estado: {{ dynatrace_state }}
+          Nivel de Impacto: {{ dynatrace_impact_level }}
+          Hosts Afectados: {{ affected_hosts | join(', ') if affected_hosts else 'Ninguno' }}
+          Servicios Afectados: {{ affected_services | join(', ') if affected_services else 'Ninguno' }}
+          Caso Aranda: {{ aranda_case_number }}
+          ==============================================
+
+    - name: "Validar host objetivo para servicios"
+      debug:
+        msg: |
+          ==============================================
+          VALIDACIÓN DE HOST OBJETIVO - SERVICIOS
+          ==============================================
+          Host actual de Ansible: {{ inventory_hostname }}
+          Host reportado por Zabbix: {{ zabbix_host_name | default('N/A') }}
+          IP del host: {{ ansible_default_ipv4.address | default('N/A') }}
+          Sistema: {{ ansible_distribution | default('N/A') }} {{ ansible_distribution_version | default('') }}
+          ==============================================
+
+    - name: "Verificar servicios en el host actual"
+      service_facts:
+      register: service_facts_result
+      ignore_errors: yes
+
+    - name: "Verificar estado de servicios comunes"
+      systemd:
+        name: "{{ item }}"
+      loop: "{{ common_services }}"
+      register: common_service_status
+      ignore_errors: yes
+
+    - name: "Verificar puertos de servicios localmente"
+      wait_for:
+        host: "127.0.0.1"
+        port: "{{ service_ports[item] }}"
+        timeout: 5
+      loop: "{{ common_services }}"
+      when: item in service_ports
+      register: port_check_results
+      ignore_errors: yes
+
+    - name: "Verificar procesos activos"
+      shell: |
+        if [ {{ affected_services | length }} -gt 0 ]; then
+          ps aux | grep -E "{{ affected_services | join('|') }}" | grep -v grep || echo "No processes found for specified services"
+        else
+          ps aux | grep -E "httpd|apache2|nginx|mysql|docker" | grep -v grep || echo "No common service processes found"
+        fi
+      register: process_check_result
+      ignore_errors: yes
+
+    - name: "Verificar logs de servicios afectados"
+      shell: |
+        for service in {{ affected_services | join(' ') }}; do
+          echo "=== Logs for $service ==="
+          journalctl -u $service --since="10 minutes ago" --no-pager -q | head -20 || echo "No logs found for $service"
+        done
+      delegate_to: "{{ item }}"
+      loop: "{{ affected_hosts }}"
+      when: 
+        - affected_hosts | length > 0
+        - affected_services | length > 0
+      register: service_logs_results
+      ignore_errors: yes
+
+    - name: "Verificar conexiones de red activas"
+      shell: |
+        netstat -tulpn | grep LISTEN | head -20
+      delegate_to: "{{ item }}"
+      loop: "{{ affected_hosts }}"
+      when: affected_hosts | length > 0
+      register: network_connections_results
+      ignore_errors: yes
+
+    - name: "Verificar disponibilidad de URLs de servicios web"
+      uri:
+        url: "http://{{ item[0] }}:{{ service_ports[item[1]] }}"
+        method: GET
+        timeout: 10
+      loop: "{{ affected_hosts | product(['httpd', 'apache2', 'nginx']) | list }}"
+      when: 
+        - affected_hosts | length > 0
+        - item[1] in service_ports
+        - "'web' in dynatrace_problem_title.lower() or 'http' in dynatrace_problem_title.lower()"
+      register: web_service_check
+      ignore_errors: yes
+
+    - name: "Intentar acciones de remediación para servicios"
+      block:
+        - name: "Reiniciar servicios afectados específicos"
+          systemd:
+            name: "{{ service_item }}"
+            state: restarted
+            enabled: yes
+          delegate_to: "{{ host_item }}"
+          loop: "{{ affected_hosts | product(affected_services) | list }}"
+          loop_control:
+            loop_var: combined_item
+          vars:
+            host_item: "{{ combined_item[0] }}"
+            service_item: "{{ combined_item[1] }}"
+          when: 
+            - affected_hosts | length > 0
+            - affected_services | length > 0
+            - dynatrace_state == 'OPEN'
+          register: service_restart_results
+          ignore_errors: yes
+
+        - name: "Verificar servicios después del reinicio"
+          systemd:
+            name: "{{ service_item }}"
+          delegate_to: "{{ host_item }}"
+          loop: "{{ affected_hosts | product(affected_services) | list }}"
+          loop_control:
+            loop_var: combined_item
+          vars:
+            host_item: "{{ combined_item[0] }}"
+            service_item: "{{ combined_item[1] }}"
+          when: 
+            - affected_hosts | length > 0
+            - affected_services | length > 0
+            - service_restart_results is defined
+          register: post_restart_status
+          ignore_errors: yes
+
+        - name: "Verificar conectividad después de remediación"
+          wait_for:
+            host: "{{ item[0] }}"
+            port: "{{ service_ports[item[1]] }}"
+            timeout: 10
+          loop: "{{ affected_hosts | product(affected_services) | list }}"
+          when: 
+            - affected_hosts | length > 0
+            - affected_services | length > 0
+            - item[1] in service_ports
+            - service_restart_results is defined
+          register: post_restart_connectivity
+          ignore_errors: yes
+
+      rescue:
+        - name: "Log de error en remediación de servicios"
+          debug:
+            msg: "Error en remediación de servicios: {{ ansible_failed_result.msg | default('Error desconocido') }}"
+
+    - name: "Generar reporte de servicios"
+      debug:
+        msg: |
+          ==============================================
+          REPORTE DE VERIFICACIÓN DE SERVICIOS
+          ==============================================
+          Problema Dynatrace: {{ dynatrace_problem_id }}
+          Caso Aranda: {{ aranda_case_number }}
+          
+          SERVICIOS VERIFICADOS:
+          {% for host in affected_hosts %}
+          
+          HOST: {{ host }}
+          -----------------------------------------------
+          {% if service_facts_results.results[loop.index0] is defined %}
+          Servicios activos: {{ service_facts_results.results[loop.index0].ansible_facts.services.keys() | list | length if service_facts_results.results[loop.index0].ansible_facts is defined else 'N/A' }}
+          {% endif %}
+          
+          Servicios afectados reportados: {{ affected_services | join(', ') if affected_services else 'Ninguno especificado' }}
+          
+          {% if network_connections_results.results[loop.index0] is defined %}
+          Puertos en escucha:
+          {{ network_connections_results.results[loop.index0].stdout | default('N/A') }}
+          {% endif %}
+          
+          {% if service_logs_results is defined and service_logs_results.results[loop.index0] is defined %}
+          Logs recientes de servicios:
+          {{ service_logs_results.results[loop.index0].stdout | default('Sin logs disponibles') }}
+          {% endif %}
+          
+          {% endfor %}
+          
+          ACCIONES DE REMEDIACIÓN:
+          {% if service_restart_results is defined %}
+          - Reinicio de servicios: {{ 'COMPLETADO' if service_restart_results.changed else 'NO REQUERIDO' }}
+          {% endif %}
+          {% if post_restart_status is defined %}
+          - Verificación post-reinicio: COMPLETADA
+          {% endif %}
+          {% if post_restart_connectivity is defined %}
+          - Verificación de conectividad: COMPLETADA
+          {% endif %}
+          
+          ==============================================
+
+    - name: "Crear reporte detallado de servicios"
+      copy:
+        content: |
+          REPORTE DE AUTOMATIZACIÓN - VERIFICACIÓN DE SERVICIOS
+          ====================================================
+          Timestamp: {{ ansible_date_time.iso8601 | default('N/A') }}
+          Problema ID: {{ dynatrace_problem_id }}
+          Título: {{ dynatrace_problem_title }}
+          Estado: {{ dynatrace_state }}
+          Caso Aranda: {{ aranda_case_number }}
+          
+          Hosts Verificados: {{ affected_hosts | join(', ') if affected_hosts else 'Ninguno' }}
+          Servicios Afectados: {{ affected_services | join(', ') if affected_services else 'Ninguno' }}
+          
+          VERIFICACIONES REALIZADAS:
+          - Estado de servicios del sistema
+          - Verificación de puertos de servicio
+          - Revisión de procesos activos
+          - Análisis de logs de servicios
+          - Verificación de conectividad de red
+          {% if "'web' in dynatrace_problem_title.lower() or 'http' in dynatrace_problem_title.lower()" %}
+          - Verificación de servicios web HTTP
+          {% endif %}
+          
+          ACCIONES DE REMEDIACIÓN:
+          {% if service_restart_results is defined %}
+          - Reinicio automático de servicios afectados
+          - Verificación post-reinicio
+          {% endif %}
+          
+          Playbook ejecutado: service-check.yml
+          Automatización completada por Ansible AWX
+        dest: "/tmp/dynatrace_service_automation_{{ dynatrace_problem_id }}_{{ ansible_date_time.epoch | default('unknown') }}.txt"
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: "Recomendaciones finales"
+      debug:
+        msg: |
+          ==============================================
+          RECOMENDACIONES Y PRÓXIMOS PASOS
+          ==============================================
+          
+          INMEDIATOS:
+          - Verificar métricas actualizadas en Dynatrace
+          - Revisar dashboard de servicios afectados
+          - Confirmar restauración de funcionalidad
+          
+          SI EL PROBLEMA PERSISTE:
+          - Escalar a equipo de infraestructura
+          - Revisar configuración de servicios
+          - Verificar dependencias entre servicios
+          - Considerar análisis de logs más profundo
+          
+          MONITOREO CONTINUO:
+          - Seguimiento en Dynatrace por 30 minutos
+          - Verificación de alertas relacionadas
+          - Validación de métricas de rendimiento
+          
+          Automatización completada: {{ ansible_date_time.iso8601 | default('N/A') }}
+          ==============================================
