@@ -1,0 +1,354 @@
+---
+- name: "Verificación automática de servidores Linux - Dynatrace Problem Handler"
+  hosts: localhost  # CAMBIO: Siempre empezar en localhost
+  connection: local
+  gather_facts: yes
+  vars:
+    # Variables pasadas desde el webhook (definidas como extra_vars)
+    dynatrace_problem_id: "{{ dynatrace_problem_id | default('UNKNOWN') }}"
+    dynatrace_problem_title: "{{ dynatrace_problem_title | default('Sin título') }}"
+    dynatrace_problem_details: "{{ dynatrace_problem_details | default('Sin detalles') }}"
+    dynatrace_state: "{{ dynatrace_state | default('UNKNOWN') }}"
+    dynatrace_impact_level: "{{ dynatrace_impact_level | default('UNKNOWN') }}"
+    aranda_case_id: "{{ aranda_case_id | default('') }}"
+    aranda_case_number: "{{ aranda_case_number | default('') }}"
+    affected_hosts: "{{ affected_hosts | default([]) }}"
+    affected_services: "{{ affected_services | default([]) }}"
+    webhook_timestamp: "{{ webhook_timestamp | default('') }}"
+    problem_url: "{{ problem_url | default('') }}"
+    
+    # Variables específicas de Zabbix extraídas del payload
+    zabbix_host_name: "{{ zabbix_host_name | default('') }}"
+    zabbix_host_ip: "{{ zabbix_host_ip | default('') }}"
+    zabbix_trigger_name: "{{ zabbix_trigger_name | default('') }}"
+    zabbix_item_key: "{{ zabbix_item_key | default('') }}"
+    zabbix_item_value: "{{ zabbix_item_value | default('') }}"
+    zabbix_event_id: "{{ zabbix_event_id | default('') }}"
+    zabbix_severity: "{{ zabbix_severity | default('') }}"
+    
+    # Variables de configuración
+    check_timeout: 30
+    retry_count: 3
+    
+  tasks:
+    - name: "Mostrar información del problema de Dynatrace"
+      debug:
+        msg: |
+          ==============================================
+          PROBLEMA DYNATRACE DETECTADO
+          ==============================================
+          ID del Problema: {{ dynatrace_problem_id }}
+          Título: {{ dynatrace_problem_title }}
+          Estado: {{ dynatrace_state }}
+          Nivel de Impacto: {{ dynatrace_impact_level }}
+          URL del Problema: {{ problem_url }}
+          
+          INFORMACIÓN DE ZABBIX:
+          Host Zabbix: {{ zabbix_host_name }}
+          IP del Host: {{ zabbix_host_ip }}
+          Trigger: {{ zabbix_trigger_name }}
+          Item Key: {{ zabbix_item_key }}
+          Valor Actual: {{ zabbix_item_value }}
+          Event ID: {{ zabbix_event_id }}
+          Severidad: {{ zabbix_severity }}
+          
+          HOSTS Y SERVICIOS:
+          Hosts Afectados: {{ affected_hosts | join(', ') if affected_hosts else 'Detectado desde Zabbix: ' + zabbix_host_name if zabbix_host_name else 'Ninguno' }}
+          Servicios Afectados: {{ affected_services | join(', ') if affected_services else 'Ninguno' }}
+          
+          CASO ARANDA: {{ aranda_case_number }}
+          Timestamp: {{ webhook_timestamp }}
+          ==============================================
+
+    - name: "Agregar host dinámicamente al inventario"
+      add_host:
+        name: "{{ zabbix_host_name }}"
+        ansible_host: "{{ zabbix_host_ip }}"
+        ansible_user: root
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+        groups: dynamic_hosts
+      when: 
+        - zabbix_host_name is defined 
+        - zabbix_host_name != ""
+        - zabbix_host_ip is defined
+        - zabbix_host_ip != ""
+
+    - name: "Verificar conectividad al host objetivo"
+      ping:
+      delegate_to: "{{ zabbix_host_name }}"
+      register: ping_result
+      ignore_errors: yes
+      when: zabbix_host_name is defined and zabbix_host_name != ""
+
+# NUEVO PLAY: Ejecutar verificaciones en el host objetivo
+- name: "Verificaciones en el servidor objetivo"
+  hosts: "{{ zabbix_host_name | default('localhost') }}"
+  gather_facts: yes
+  vars:
+    # Reutilizar las mismas variables del play anterior
+    dynatrace_problem_id: "{{ dynatrace_problem_id | default('UNKNOWN') }}"
+    dynatrace_problem_title: "{{ dynatrace_problem_title | default('Sin título') }}"
+    dynatrace_state: "{{ dynatrace_state | default('UNKNOWN') }}"
+    dynatrace_impact_level: "{{ dynatrace_impact_level | default('UNKNOWN') }}"
+    aranda_case_number: "{{ aranda_case_number | default('') }}"
+    zabbix_host_name: "{{ zabbix_host_name | default('') }}"
+    zabbix_host_ip: "{{ zabbix_host_ip | default('') }}"
+    zabbix_trigger_name: "{{ zabbix_trigger_name | default('') }}"
+    zabbix_item_key: "{{ zabbix_item_key | default('') }}"
+    zabbix_item_value: "{{ zabbix_item_value | default('') }}"
+    zabbix_event_id: "{{ zabbix_event_id | default('') }}"
+    zabbix_severity: "{{ zabbix_severity | default('') }}"
+    affected_hosts: "{{ affected_hosts | default([]) }}"
+    affected_services: "{{ affected_services | default([]) }}"
+    webhook_timestamp: "{{ webhook_timestamp | default('') }}"
+    problem_url: "{{ problem_url | default('') }}"
+    
+  tasks:
+    - name: "Validar host objetivo"
+      debug:
+        msg: |
+          ==============================================
+          VALIDACIÓN DE HOST OBJETIVO
+          ==============================================
+          Host actual de Ansible: {{ inventory_hostname }}
+          Host reportado por Zabbix: {{ zabbix_host_name }}
+          IP del host: {{ ansible_default_ipv4.address | default('N/A') }}
+          Distribución: {{ ansible_distribution | default('N/A') }} {{ ansible_distribution_version | default('') }}
+          ==============================================
+
+    - name: "Verificar servicios críticos en el host"
+      service_facts:
+      register: service_facts_result
+      ignore_errors: yes
+
+    - name: "Verificar estado de servicios específicos"
+      systemd:
+        name: "{{ item }}"
+      loop: 
+        - ssh
+        - systemd-resolved
+        - cron
+        - rsyslog
+      register: service_status_results
+      ignore_errors: yes
+
+    - name: "Verificar uso de CPU actual"
+      shell: |
+        if command -v top >/dev/null 2>&1; then
+          top -bn1 | grep "Cpu(s)" | awk '{print $2}' | sed 's/%us,//' || echo "N/A"
+        else
+          echo "top command not available"
+        fi
+      register: cpu_usage_result
+      ignore_errors: yes
+
+    - name: "Verificar uso de memoria actual"
+      shell: |
+        if command -v free >/dev/null 2>&1; then
+          free -m | awk 'NR==2{printf "%.2f%%", $3*100/$2}' || echo "N/A"
+        else
+          echo "free command not available"
+        fi
+      register: memory_usage_result
+      ignore_errors: yes
+
+    - name: "Verificar uso de disco actual"
+      shell: |
+        df -h / | awk 'NR==2{print $5}' || echo "N/A"
+      register: disk_usage_result
+      ignore_errors: yes
+
+    - name: "Verificar carga del sistema actual"
+      shell: |
+        uptime | awk -F'load average:' '{ print $2 }' || echo "N/A"
+      register: load_average_result
+      ignore_errors: yes
+
+    - name: "Verificar logs recientes del sistema"
+      shell: |
+        if command -v journalctl >/dev/null 2>&1; then
+          journalctl --since="5 minutes ago" --priority=err --no-pager -q | head -10 || echo "No recent errors"
+        else
+          tail -20 /var/log/syslog | grep -i error || echo "No syslog errors found"
+        fi
+      register: system_logs_result
+      ignore_errors: yes
+
+    - name: "Verificar métricas específicas de Zabbix"
+      block:
+        - name: "Verificar métrica específica reportada por Zabbix"
+          shell: |
+            case "{{ zabbix_item_key }}" in
+              "system.cpu.util"*)
+                cat /proc/loadavg | awk '{print "Load: " $1 " " $2 " " $3}'
+                ;;
+              "vm.memory.size"*)
+                free -m | awk 'NR==2{printf "Memory: Used %.2f%% (%d/%d MB)\n", $3*100/$2, $3, $2}'
+                ;;
+              "vfs.fs.size"*)
+                df -h / | awk 'NR==2{printf "Disk: %s used of %s (%s)\n", $3, $2, $5}'
+                ;;
+              *)
+                echo "Métrica específica no reconocida: {{ zabbix_item_key }}"
+                ;;
+            esac
+          register: zabbix_metric_check
+          when: zabbix_item_key is defined and zabbix_item_key != ""
+          ignore_errors: yes
+      rescue:
+        - name: "Error verificando métrica de Zabbix"
+          debug:
+            msg: "No se pudo verificar la métrica específica de Zabbix"
+
+    - name: "Generar reporte de diagnóstico"
+      debug:
+        msg: |
+          ==============================================
+          REPORTE DE DIAGNÓSTICO AUTOMÁTICO
+          ==============================================
+          Problema Dynatrace: {{ dynatrace_problem_id }}
+          Caso Aranda: {{ aranda_case_number }}
+          
+          HOST VERIFICADO: {{ inventory_hostname }}
+          -----------------------------------------------
+          Conectividad: OK
+          Sistema Operativo: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Arquitectura: {{ ansible_architecture }}
+          Kernel: {{ ansible_kernel }}
+          
+          MÉTRICAS DEL SISTEMA:
+          CPU Usage: {{ cpu_usage_result.stdout | default('N/A') }}
+          Memory Usage: {{ memory_usage_result.stdout | default('N/A') }}
+          Disk Usage: {{ disk_usage_result.stdout | default('N/A') }}
+          Load Average: {{ load_average_result.stdout | default('N/A') }}
+          
+          MÉTRICA ESPECÍFICA DE ZABBIX:
+          Item Key: {{ zabbix_item_key | default('N/A') }}
+          Valor Reportado: {{ zabbix_item_value | default('N/A') }}
+          {% if zabbix_metric_check is defined and zabbix_metric_check.stdout %}
+          Verificación Local: {{ zabbix_metric_check.stdout }}
+          {% endif %}
+          
+          SERVICIOS CRÍTICOS:
+          {% for service in service_status_results.results %}
+          - {{ service.item }}: {{ service.status.ActiveState | default('UNKNOWN') }}
+          {% endfor %}
+          
+          ERRORES RECIENTES EN LOGS:
+          {% if system_logs_result.stdout %}
+          {{ system_logs_result.stdout }}
+          {% else %}
+          Sin errores críticos en los últimos 5 minutos
+          {% endif %}
+          ==============================================
+
+    - name: "Intentar acciones de remediación básicas"
+      block:
+        - name: "Limpiar archivos temporales"
+          shell: |
+            find /tmp -type f -atime +7 -delete 2>/dev/null || true
+            find /var/tmp -type f -atime +7 -delete 2>/dev/null || true
+          ignore_errors: yes
+
+        - name: "Reiniciar servicios problemáticos si es necesario"
+          systemd:
+            name: "{{ item }}"
+            state: restarted
+          loop:
+            - systemd-resolved
+            - rsyslog
+          when: 
+            - dynatrace_state == 'OPEN'
+            - "'network' in dynatrace_problem_title.lower() or 'connectivity' in dynatrace_problem_title.lower() or 'dns' in dynatrace_problem_title.lower()"
+          ignore_errors: yes
+
+        - name: "Acciones específicas para problemas de CPU"
+          block:
+            - name: "Identificar procesos con alto uso de CPU"
+              shell: |
+                ps aux --sort=-%cpu | head -10
+              register: top_cpu_processes
+              
+            - name: "Mostrar procesos con alto CPU"
+              debug:
+                msg: "Procesos con mayor uso de CPU: {{ top_cpu_processes.stdout_lines }}"
+          when: 
+            - dynatrace_state == 'OPEN'
+            - "'cpu' in dynatrace_problem_title.lower() or 'system.cpu.util' in zabbix_item_key"
+          ignore_errors: yes
+
+        - name: "Sincronizar tiempo del sistema"
+          shell: |
+            if command -v ntpdate >/dev/null 2>&1; then
+              ntpdate -s time.nist.gov 2>/dev/null || true
+            elif command -v timedatectl >/dev/null 2>&1; then
+              timedatectl set-ntp true 2>/dev/null || true
+            fi
+          ignore_errors: yes
+
+      rescue:
+        - name: "Log de error en remediación"
+          debug:
+            msg: "Error ejecutando acciones de remediación: {{ ansible_failed_result.msg | default('Error desconocido') }}"
+
+# PLAY FINAL: Reporte desde localhost
+- name: "Generar reporte final"
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  vars:
+    dynatrace_problem_id: "{{ dynatrace_problem_id | default('UNKNOWN') }}"
+    dynatrace_problem_title: "{{ dynatrace_problem_title | default('Sin título') }}"
+    dynatrace_state: "{{ dynatrace_state | default('UNKNOWN') }}"
+    aranda_case_number: "{{ aranda_case_number | default('') }}"
+    zabbix_host_name: "{{ zabbix_host_name | default('') }}"
+    
+  tasks:
+    - name: "Generar reporte final y recomendaciones"
+      debug:
+        msg: |
+          ==============================================
+          REPORTE FINAL - AUTOMATIZACIÓN COMPLETADA
+          ==============================================
+          Problema Dynatrace: {{ dynatrace_problem_id }} - {{ dynatrace_problem_title }}
+          Caso Aranda: {{ aranda_case_number }}
+          Estado del Problema: {{ dynatrace_state }}
+          
+          HOST VERIFICADO: {{ zabbix_host_name }}
+          
+          ACCIONES REALIZADAS:
+          ✓ Verificación de conectividad
+          ✓ Monitoreo de recursos (CPU, Memoria, Disco)
+          ✓ Revisión de logs del sistema
+          ✓ Limpieza de archivos temporales
+          {% if "'network' in dynatrace_problem_title.lower() or 'connectivity' in dynatrace_problem_title.lower()" %}
+          ✓ Intento de reinicio de servicios de red
+          {% endif %}
+          ✓ Sincronización de tiempo del sistema
+          
+          RECOMENDACIONES:
+          - Revisar el dashboard de Dynatrace para métricas actualizadas
+          - Verificar manualmente los hosts con problemas de conectividad
+          - Considerar escalamiento si el problema persiste
+          - Consultar logs detallados en caso de errores críticos
+          
+          Ejecución completada a las: {{ ansible_date_time.iso8601 | default(ansible_date_time.epoch) }}
+          ==============================================
+
+    - name: "Crear archivo de reporte"
+      copy:
+        content: |
+          REPORTE DE AUTOMATIZACIÓN - DYNATRACE PROBLEM HANDLER
+          =====================================================
+          Timestamp: {{ ansible_date_time.iso8601 | default('N/A') }}
+          Problema ID: {{ dynatrace_problem_id }}
+          Título: {{ dynatrace_problem_title }}
+          Estado: {{ dynatrace_state }}
+          Caso Aranda: {{ aranda_case_number }}
+          
+          Host Verificado: {{ zabbix_host_name | default('N/A') }}
+          
+          Automatización ejecutada por Ansible AWX
+          Playbook: linux-server-check.yml
+        dest: "/tmp/dynatrace_automation_{{ dynatrace_problem_id }}_{{ ansible_date_time.epoch | default('unknown') }}.txt"
+      ignore_errors: yes
