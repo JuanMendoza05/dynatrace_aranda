@@ -1,6 +1,7 @@
 ---
 - name: "Verificación automática de servidores Linux - Dynatrace Problem Handler"
-  hosts: "{{ target_hosts | default('all') }}"
+  hosts: "{{ target_hosts | default('localhost') }}"
+  connection: "{{ ansible_connection | default('ssh') }}"
   gather_facts: yes
   vars:
     # Variables pasadas desde el webhook (definidas como extra_vars)
@@ -30,6 +31,20 @@
     retry_count: 3
     
   tasks:
+    - name: "Agregar host dinámicamente al inventario"
+      add_host:
+        name: "{{ zabbix_host_name }}"
+        ansible_host: "{{ zabbix_host_ip }}"
+        ansible_user: root
+        groups: dynamic_hosts
+      when: 
+        - zabbix_host_name is defined 
+        - zabbix_host_name != ""
+        - zabbix_host_ip is defined
+        - zabbix_host_ip != ""
+        - inventory_hostname == "localhost"
+      delegate_to: localhost
+
     - name: "Mostrar información del problema de Dynatrace"
       debug:
         msg: |
@@ -303,3 +318,5 @@
         dest: "/tmp/dynatrace_automation_{{ dynatrace_problem_id }}_{{ ansible_date_time.epoch | default('unknown') }}.txt"
       delegate_to: localhost
       ignore_errors: yes
+
+
