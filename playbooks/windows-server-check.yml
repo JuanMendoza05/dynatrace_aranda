@@ -1,0 +1,597 @@
+---
+- name: "Verificación automática de servidores Windows - Handler Universal"
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  vars:
+    # Variables comunes de Dynatrace
+    dynatrace_problem_id: "{{ dynatrace_problem_id | default('UNKNOWN') }}"
+    dynatrace_problem_title: "{{ dynatrace_problem_title | default('Sin título') }}"
+    dynatrace_problem_details: "{{ dynatrace_problem_details | default('Sin detalles') }}"
+    dynatrace_state: "{{ dynatrace_state | default('UNKNOWN') }}"
+    dynatrace_impact_level: "{{ dynatrace_impact_level | default('UNKNOWN') }}"
+    aranda_case_id: "{{ aranda_case_id | default('') }}"
+    aranda_case_number: "{{ aranda_case_number | default('') }}"
+    affected_hosts: "{{ affected_hosts | default([]) }}"
+    affected_services: "{{ affected_services | default([]) }}"
+    webhook_timestamp: "{{ webhook_timestamp | default('') }}"
+    problem_url: "{{ problem_url | default('') }}"
+    
+    # Detección automática de fuente de datos
+    data_source: "{{ data_source | default('auto') }}"
+    
+    # Variables normalizadas (se detectan automáticamente)
+    source_host_name: >-
+      {%- if dynatrace_host_name is defined and dynatrace_host_name != "" -%}
+        {{ dynatrace_host_name }}
+      {%- elif zabbix_host_name is defined and zabbix_host_name != "" -%}
+        {{ zabbix_host_name }}
+      {%- else -%}
+        unknown
+      {%- endif -%}
+    
+    source_host_ip: >-
+      {%- if dynatrace_host_ip is defined and dynatrace_host_ip != "" -%}
+        {{ dynatrace_host_ip }}
+      {%- elif zabbix_host_ip is defined and zabbix_host_ip != "" -%}
+        {{ zabbix_host_ip }}
+      {%- else -%}
+        unknown
+      {%- endif -%}
+    
+    detected_source: >-
+      {%- if data_source != "auto" -%}
+        {{ data_source }}
+      {%- elif dynatrace_host_name is defined and dynatrace_host_name != "" -%}
+        dynatrace
+      {%- elif zabbix_host_name is defined and zabbix_host_name != "" -%}
+        zabbix
+      {%- else -%}
+        unknown
+      {%- endif -%}
+    
+    # Variables de configuración
+    check_timeout: 30
+    retry_count: 3
+    
+  tasks:
+    - name: "Detectar y normalizar fuente de datos"
+      set_fact:
+        normalized_vars:
+          source: "{{ detected_source }}"
+          host_name: "{{ source_host_name }}"
+          host_ip: "{{ source_host_ip }}"
+          problem_type: >-
+            {%- if detected_source == "dynatrace" -%}
+              {{ dynatrace_event_type | default('UNKNOWN') }}
+            {%- elif detected_source == "zabbix" -%}
+              {{ zabbix_trigger_name | default('UNKNOWN') }}
+            {%- else -%}
+              UNKNOWN
+            {%- endif -%}
+          severity: >-
+            {%- if detected_source == "dynatrace" -%}
+              {{ dynatrace_severity | default('UNKNOWN') }}
+            {%- elif detected_source == "zabbix" -%}
+              {{ zabbix_severity | default('UNKNOWN') }}
+            {%- else -%}
+              UNKNOWN
+            {%- endif -%}
+          metric_value: >-
+            {%- if detected_source == "dynatrace" -%}
+              {{ dynatrace_annotation | default('N/A') }}
+            {%- elif detected_source == "zabbix" -%}
+              {{ zabbix_item_value | default('N/A') }}
+            {%- else -%}
+              N/A
+            {%- endif -%}
+
+    - name: "Mostrar información del problema detectado"
+      debug:
+        msg: |
+          ==============================================
+          PROBLEMA DETECTADO - {{ normalized_vars.source | upper }}
+          ==============================================
+          ID del Problema: {{ dynatrace_problem_id }}
+          Título: {{ dynatrace_problem_title }}
+          Estado: {{ dynatrace_state }}
+          Nivel de Impacto: {{ dynatrace_impact_level }}
+          URL del Problema: {{ problem_url }}
+          
+          FUENTE DE DATOS: {{ normalized_vars.source | upper }}
+          Host: {{ normalized_vars.host_name }}
+          IP del Host: {{ normalized_vars.host_ip }}
+          Tipo de Problema: {{ normalized_vars.problem_type }}
+          Severidad: {{ normalized_vars.severity }}
+          Métrica/Valor: {{ normalized_vars.metric_value }}
+          
+          {% if detected_source == "dynatrace" %}
+          INFORMACIÓN DYNATRACE:
+          Event Type: {{ dynatrace_event_type | default('N/A') }}
+          Annotation: {{ dynatrace_annotation | default('N/A') }}
+          AWS Region: {{ aws_region | default('N/A') }}
+          AWS AZ: {{ aws_availability_zone | default('N/A') }}
+          AWS Resource ID: {{ aws_resource_id | default('N/A') }}
+          {% elif detected_source == "zabbix" %}
+          INFORMACIÓN ZABBIX:
+          Trigger: {{ zabbix_trigger_name | default('N/A') }}
+          Item Key: {{ zabbix_item_key | default('N/A') }}
+          Valor Actual: {{ zabbix_item_value | default('N/A') }}
+          Event ID: {{ zabbix_event_id | default('N/A') }}
+          {% endif %}
+          
+          HOSTS Y SERVICIOS:
+          Hosts Afectados: {{ affected_hosts | join(', ') if affected_hosts else 'Detectado: ' + normalized_vars.host_name }}
+          Servicios Afectados: {{ affected_services | join(', ') if affected_services else 'Ninguno' }}
+          
+          CASO ARANDA: {{ aranda_case_number }}
+          Timestamp: {{ webhook_timestamp }}
+          ==============================================
+
+    - name: "Validar datos mínimos requeridos"
+      assert:
+        that:
+          - normalized_vars.host_name != "unknown"
+          - normalized_vars.host_ip != "unknown"
+          - normalized_vars.source in ["dynatrace", "zabbix"]
+        fail_msg: |
+          ERROR: Datos insuficientes para proceder
+          Host name: {{ normalized_vars.host_name }}
+          Host IP: {{ normalized_vars.host_ip }}
+          Source: {{ normalized_vars.source }}
+        success_msg: "✅ Datos validados correctamente - Fuente: {{ normalized_vars.source | upper }}"
+
+    - name: "Agregar host Windows dinámicamente al inventario"
+      add_host:
+        name: "{{ normalized_vars.host_name }}"
+        ansible_host: "{{ normalized_vars.host_ip }}"
+        ansible_user: Administrator
+        ansible_password: "{{ windows_admin_password | default('') }}"
+        ansible_connection: winrm
+        ansible_winrm_server_cert_validation: ignore
+        ansible_winrm_port: 5986
+        ansible_winrm_scheme: https
+        groups: 
+          - dynamic_windows_hosts
+          - "{{ normalized_vars.source }}_monitored"
+          - "problem_{{ dynatrace_problem_id | default('unknown') }}"
+      when: 
+        - normalized_vars.host_name != "unknown"
+        - normalized_vars.host_ip != "unknown"
+
+    - name: "Verificar conectividad al host Windows objetivo"
+      win_ping:
+      delegate_to: "{{ normalized_vars.host_name }}"
+      register: ping_result
+      ignore_errors: yes
+      when: normalized_vars.host_name != "unknown"
+
+# PLAY 2: Verificaciones en el servidor Windows objetivo
+- name: "Verificaciones en el servidor Windows objetivo"
+  hosts: "{{ normalized_vars.host_name | default('localhost') }}"
+  gather_facts: yes
+  vars:
+    # Reutilizar variables del play anterior
+    dynatrace_problem_id: "{{ dynatrace_problem_id | default('UNKNOWN') }}"
+    dynatrace_problem_title: "{{ dynatrace_problem_title | default('Sin título') }}"
+    dynatrace_state: "{{ dynatrace_state | default('UNKNOWN') }}"
+    dynatrace_impact_level: "{{ dynatrace_impact_level | default('UNKNOWN') }}"
+    aranda_case_number: "{{ aranda_case_number | default('') }}"
+    
+  tasks:
+    - name: "Heredar variables normalizadas del play anterior"
+      set_fact:
+        inherited_vars: "{{ hostvars['localhost']['normalized_vars'] }}"
+
+    - name: "Validar host Windows objetivo"
+      debug:
+        msg: |
+          ==============================================
+          VALIDACIÓN DE HOST WINDOWS OBJETIVO
+          ==============================================
+          Host actual de Ansible: {{ inventory_hostname }}
+          Host desde {{ inherited_vars.source | upper }}: {{ inherited_vars.host_name }}
+          IP del host: {{ ansible_ip_addresses[0] | default('N/A') }}
+          Sistema Operativo: {{ ansible_os_name | default('N/A') }} {{ ansible_os_version | default('') }}
+          Edición: {{ ansible_windows_edition | default('N/A') }}
+          Arquitectura: {{ ansible_architecture | default('N/A') }}
+          Fuente de datos: {{ inherited_vars.source | upper }}
+          ==============================================
+
+    - name: "Obtener información de servicios Windows críticos"
+      win_service_info:
+        name: "{{ item }}"
+      loop:
+        - Winmgmt
+        - EventLog
+        - Spooler
+        - BITS
+        - Dnscache
+        - W32Time
+        - LanmanWorkstation
+        - LanmanServer
+      register: service_status_results
+      ignore_errors: yes
+
+    - name: "Verificar uso de CPU actual"
+      win_shell: |
+        Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 3 | 
+        Select-Object -ExpandProperty CounterSamples | 
+        Measure-Object -Property CookedValue -Average | 
+        ForEach-Object { [math]::Round($_.Average, 2) }
+      register: cpu_usage_result
+      ignore_errors: yes
+
+    - name: "Verificar uso de memoria actual"
+      win_shell: |
+        $mem = Get-CimInstance -ClassName Win32_OperatingSystem
+        $totalMem = [math]::Round($mem.TotalVisibleMemorySize / 1MB, 2)
+        $freeMem = [math]::Round($mem.FreePhysicalMemory / 1MB, 2)
+        $usedMem = $totalMem - $freeMem
+        $percentUsed = [math]::Round(($usedMem / $totalMem) * 100, 2)
+        "Used: $usedMem GB / $totalMem GB ($percentUsed%)"
+      register: memory_usage_result
+      ignore_errors: yes
+
+    - name: "Verificar uso de disco actual"
+      win_shell: |
+        Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3" | 
+        ForEach-Object { 
+            $total = [math]::Round($_.Size / 1GB, 2)
+            $free = [math]::Round($_.FreeSpace / 1GB, 2)
+            $used = $total - $free
+            $percent = [math]::Round(($used / $total) * 100, 2)
+            "$($_.DeviceID) Used: $used GB / $total GB ($percent%)"
+        }
+      register: disk_usage_result
+      ignore_errors: yes
+
+    - name: "Verificar carga del sistema y procesos"
+      win_shell: |
+        $cpuLoad = Get-Counter '\System\Processor Queue Length' -SampleInterval 1 -MaxSamples 1 | 
+                   Select-Object -ExpandProperty CounterSamples | 
+                   Select-Object -ExpandProperty CookedValue
+        $processCount = (Get-Process).Count
+        "Processor Queue Length: $cpuLoad, Total Processes: $processCount"
+      register: load_average_result
+      ignore_errors: yes
+
+    - name: "Verificar logs recientes del sistema Windows"
+      win_shell: |
+        Get-EventLog -LogName System -EntryType Error -Newest 10 -After (Get-Date).AddMinutes(-5) | 
+        Select-Object TimeGenerated, Source, EventID, Message | 
+        Format-Table -AutoSize | Out-String
+      register: system_logs_result
+      ignore_errors: yes
+
+    - name: "Verificar métrica específica según fuente"
+      block:
+        - name: "Verificar métrica específica reportada"
+          win_shell: |
+            {% if inherited_vars.source == "zabbix" %}
+            switch ("{{ hostvars['localhost']['zabbix_item_key'] | default('') }}") {
+              "system.cpu.util" {
+                $cpu = Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 1 | 
+                       Select-Object -ExpandProperty CounterSamples | 
+                       Select-Object -ExpandProperty CookedValue
+                "CPU Usage: $([math]::Round($cpu, 2))%"
+              }
+              "vm.memory.size" {
+                $mem = Get-CimInstance -ClassName Win32_OperatingSystem
+                $totalMem = [math]::Round($mem.TotalVisibleMemorySize / 1MB, 2)
+                $freeMem = [math]::Round($mem.FreePhysicalMemory / 1MB, 2)
+                $usedMem = $totalMem - $freeMem
+                $percentUsed = [math]::Round(($usedMem / $totalMem) * 100, 2)
+                "Memory: Used $usedMem GB / $totalMem GB ($percentUsed%)"
+              }
+              "vfs.fs.size" {
+                $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3 AND DeviceID='C:'"
+                $total = [math]::Round($disk.Size / 1GB, 2)
+                $free = [math]::Round($disk.FreeSpace / 1GB, 2)
+                $used = $total - $free
+                $percent = [math]::Round(($used / $total) * 100, 2)
+                "Disk C: Used $used GB / $total GB ($percent%)"
+              }
+              default {
+                "Métrica Zabbix no reconocida: {{ hostvars['localhost']['zabbix_item_key'] | default('N/A') }}"
+              }
+            }
+            {% elif inherited_vars.source == "dynatrace" %}
+            switch ("{{ hostvars['localhost']['dynatrace_event_type'] | default('') }}") {
+              "CPU_SATURATED" {
+                $cpu = Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 3 | 
+                       Select-Object -ExpandProperty CounterSamples | 
+                       Measure-Object -Property CookedValue -Average | 
+                       ForEach-Object { [math]::Round($_.Average, 2) }
+                $queue = Get-Counter '\System\Processor Queue Length' -SampleInterval 1 -MaxSamples 1 | 
+                         Select-Object -ExpandProperty CounterSamples | 
+                         Select-Object -ExpandProperty CookedValue
+                "CPU Usage: $cpu%, Processor Queue: $queue"
+              }
+              "MEMORY_SATURATED" {
+                $mem = Get-CimInstance -ClassName Win32_OperatingSystem
+                $totalMem = [math]::Round($mem.TotalVisibleMemorySize / 1MB, 2)
+                $freeMem = [math]::Round($mem.FreePhysicalMemory / 1MB, 2)
+                $usedMem = $totalMem - $freeMem
+                $percentUsed = [math]::Round(($usedMem / $totalMem) * 100, 2)
+                "Memory: Used $usedMem GB / $totalMem GB ($percentUsed%)"
+              }
+              { $_ -like "DISK_*" } {
+                Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3" | 
+                ForEach-Object { 
+                    $total = [math]::Round($_.Size / 1GB, 2)
+                    $free = [math]::Round($_.FreeSpace / 1GB, 2)
+                    $used = $total - $free
+                    $percent = [math]::Round(($used / $total) * 100, 2)
+                    "$($_.DeviceID) Used: $used GB / $total GB ($percent%)"
+                }
+              }
+              default {
+                "Evento Dynatrace: {{ hostvars['localhost']['dynatrace_event_type'] | default('N/A') }}"
+                "Annotation: {{ hostvars['localhost']['dynatrace_annotation'] | default('N/A') }}"
+              }
+            }
+            {% else %}
+            "Fuente desconocida para verificación de métrica"
+            {% endif %}
+          register: source_metric_check
+          ignore_errors: yes
+      rescue:
+        - name: "Error verificando métrica específica"
+          debug:
+            msg: "No se pudo verificar la métrica específica de {{ inherited_vars.source | upper }}"
+
+    - name: "Generar reporte de diagnóstico Windows universal"
+      debug:
+        msg: |
+          ==============================================
+          REPORTE DE DIAGNÓSTICO AUTOMÁTICO WINDOWS
+          ==============================================
+          Problema ID: {{ dynatrace_problem_id }}
+          Caso Aranda: {{ aranda_case_number }}
+          Fuente: {{ inherited_vars.source | upper }}
+          
+          HOST WINDOWS VERIFICADO: {{ inventory_hostname }}
+          -----------------------------------------------
+          Conectividad: OK
+          Sistema Operativo: {{ ansible_os_name }} {{ ansible_os_version }}
+          Edición: {{ ansible_windows_edition }}
+          Arquitectura: {{ ansible_architecture }}
+          Uptime: {{ ansible_uptime_seconds | default(0) | int // 3600 }} horas
+          
+          MÉTRICAS DEL SISTEMA:
+          CPU Usage: {{ cpu_usage_result.stdout | default('N/A') }}%
+          Memory Usage: {{ memory_usage_result.stdout | default('N/A') }}
+          Disk Usage: 
+          {{ disk_usage_result.stdout_lines | join('\n          ') if disk_usage_result.stdout_lines else 'N/A' }}
+          System Load: {{ load_average_result.stdout | default('N/A') }}
+          
+          MÉTRICA ESPECÍFICA ({{ inherited_vars.source | upper }}):
+          Tipo/Key: {{ inherited_vars.problem_type }}
+          Valor Reportado: {{ inherited_vars.metric_value }}
+          {% if source_metric_check is defined and source_metric_check.stdout %}
+          Verificación Local: {{ source_metric_check.stdout }}
+          {% endif %}
+          
+          SERVICIOS CRÍTICOS WINDOWS:
+          {% for service in service_status_results.results %}
+          - {{ service.item }}: {{ service.services[0].state | default('UNKNOWN') if service.services else 'NOT_FOUND' }}
+          {% endfor %}
+          
+          ERRORES RECIENTES EN EVENT LOG:
+          {% if system_logs_result.stdout and system_logs_result.stdout.strip() %}
+          {{ system_logs_result.stdout }}
+          {% else %}
+          Sin errores críticos en los últimos 5 minutos
+          {% endif %}
+          ==============================================
+
+    - name: "Intentar acciones de remediación Windows inteligentes"
+      block:
+        - name: "Limpiar archivos temporales Windows"
+          win_shell: |
+            # Limpiar carpeta Temp del sistema
+            Remove-Item -Path "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+            # Limpiar Windows Temp
+            Remove-Item -Path "$env:WINDIR\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+            # Limpiar Prefetch
+            Remove-Item -Path "$env:WINDIR\Prefetch\*" -Force -ErrorAction SilentlyContinue
+            Write-Output "Archivos temporales limpiados"
+          ignore_errors: yes
+
+        - name: "Acciones específicas para problemas de CPU en Windows"
+          block:
+            - name: "Identificar procesos con alto uso de CPU"
+              win_shell: |
+                Get-Process | Sort-Object CPU -Descending | Select-Object -First 10 ProcessName, CPU, WorkingSet | Format-Table -AutoSize
+              register: top_cpu_processes
+              
+            - name: "Mostrar procesos con alto CPU"
+              debug:
+                msg: "Procesos con mayor uso de CPU: {{ top_cpu_processes.stdout }}"
+          when: 
+            - dynatrace_state == 'OPEN'
+            - "'cpu' in dynatrace_problem_title.lower() or 'CPU_SATURATED' in inherited_vars.problem_type or 'system.cpu.util' in inherited_vars.problem_type"
+          ignore_errors: yes
+
+        - name: "Acciones específicas para problemas de memoria en Windows"
+          block:
+            - name: "Verificar uso de memoria por proceso"
+              win_shell: |
+                Get-Process | Sort-Object WorkingSet -Descending | Select-Object -First 10 ProcessName, WorkingSet, PagedMemorySize | Format-Table -AutoSize
+              register: top_memory_processes
+              
+            - name: "Mostrar procesos con alta memoria"
+              debug:
+                msg: "Procesos con mayor uso de memoria: {{ top_memory_processes.stdout }}"
+                
+            - name: "Limpiar memoria caché del sistema"
+              win_shell: |
+                [System.GC]::Collect()
+                [System.GC]::WaitForPendingFinalizers()
+                [System.GC]::Collect()
+                Write-Output "Garbage Collection ejecutado"
+              ignore_errors: yes
+          when: 
+            - dynatrace_state == 'OPEN'
+            - "'memory' in dynatrace_problem_title.lower() or 'MEMORY_SATURATED' in inherited_vars.problem_type"
+          ignore_errors: yes
+
+        - name: "Sincronizar tiempo del sistema Windows"
+          win_shell: |
+            w32tm /resync /nowait
+            Write-Output "Sincronización de tiempo iniciada"
+          ignore_errors: yes
+
+        - name: "Reiniciar servicios problemáticos de Windows si es necesario"
+          win_service:
+            name: "{{ item }}"
+            state: restarted
+          loop:
+            - Dnscache
+            - W32Time
+          when: 
+            - dynatrace_state == 'OPEN'
+            - "'network' in dynatrace_problem_title.lower() or 'connectivity' in dynatrace_problem_title.lower() or 'dns' in dynatrace_problem_title.lower()"
+          ignore_errors: yes
+
+        - name: "Verificar y reparar archivos de sistema críticos"
+          win_shell: |
+            sfc /verifyonly
+          register: sfc_check
+          when: 
+            - dynatrace_state == 'OPEN'
+            - "'system' in dynatrace_problem_title.lower()"
+          ignore_errors: yes
+
+      rescue:
+        - name: "Log de error en remediación Windows"
+          debug:
+            msg: "Error ejecutando acciones de remediación: {{ ansible_failed_result.msg | default('Error desconocido') }}"
+
+# PLAY 3: Reporte final desde localhost
+- name: "Generar reporte final Windows"
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  vars:
+    dynatrace_problem_id: "{{ dynatrace_problem_id | default('UNKNOWN') }}"
+    dynatrace_problem_title: "{{ dynatrace_problem_title | default('Sin título') }}"
+    dynatrace_state: "{{ dynatrace_state | default('UNKNOWN') }}"
+    aranda_case_number: "{{ aranda_case_number | default('') }}"
+    
+  tasks:
+    - name: "Generar reporte final y recomendaciones Windows"
+      debug:
+        msg: |
+          ==============================================
+          REPORTE FINAL WINDOWS - AUTOMATIZACIÓN COMPLETADA
+          ==============================================
+          Problema ID: {{ dynatrace_problem_id }} - {{ dynatrace_problem_title }}
+          Caso Aranda: {{ aranda_case_number }}
+          Estado del Problema: {{ dynatrace_state }}
+          Fuente: {{ normalized_vars.source | upper }}
+          
+          HOST WINDOWS VERIFICADO: {{ normalized_vars.host_name }}
+          
+          ACCIONES REALIZADAS:
+          ✓ Verificación de conectividad WinRM
+          ✓ Monitoreo de recursos (CPU, Memoria, Disco)
+          ✓ Revisión de Event Logs del sistema
+          ✓ Limpieza de archivos temporales Windows
+          ✓ Verificación específica para {{ normalized_vars.source | upper }}
+          ✓ Sincronización de tiempo del sistema
+          {% if "'network' in dynatrace_problem_title.lower() or 'connectivity' in dynatrace_problem_title.lower()" %}
+          ✓ Reinicio de servicios de red críticos
+          {% endif %}
+          {% if "'memory' in dynatrace_problem_title.lower() or 'MEMORY_SATURATED' in normalized_vars.problem_type" %}
+          ✓ Limpieza de memoria caché del sistema
+          {% endif %}
+          
+          RECOMENDACIONES WINDOWS:
+          {% if normalized_vars.source == "dynatrace" %}
+          - Revisar el dashboard de Dynatrace para métricas actualizadas
+          - Verificar Performance Monitor (perfmon) para análisis detallado
+          - Considerar escalamiento automático en Azure/AWS si está disponible
+          - Revisar Event Viewer para patrones de errores
+          {% elif normalized_vars.source == "zabbix" %}
+          - Revisar el dashboard de Zabbix para métricas actualizadas
+          - Verificar triggers relacionados en Zabbix
+          - Revisar la configuración de thresholds si es necesario
+          - Verificar agente Zabbix en el servidor Windows
+          {% endif %}
+          - Verificar manualmente los hosts con problemas de conectividad
+          - Considerar análisis de dumps de memoria si hay problemas persistentes
+          - Revisar Windows Update para actualizaciones críticas
+          - Consultar logs detallados en Event Viewer para errores específicos
+          
+          Ejecución completada a las: {{ ansible_date_time.iso8601 | default(ansible_date_time.epoch) }}
+          ==============================================
+
+    - name: "Crear archivo de reporte Windows universal"
+      copy:
+        content: |
+          REPORTE DE AUTOMATIZACIÓN WINDOWS - UNIVERSAL PROBLEM HANDLER
+          ===========================================================
+          Timestamp: {{ ansible_date_time.iso8601 | default('N/A') }}
+          Problema ID: {{ dynatrace_problem_id }}
+          Título: {{ dynatrace_problem_title }}
+          Estado: {{ dynatrace_state }}
+          Caso Aranda: {{ aranda_case_number }}
+          Fuente de Datos: {{ normalized_vars.source | upper }}
+          
+          Host Windows Verificado: {{ normalized_vars.host_name | default('N/A') }}
+          Host IP: {{ normalized_vars.host_ip | default('N/A') }}
+          Tipo de Problema: {{ normalized_vars.problem_type | default('N/A') }}
+          Métrica/Valor: {{ normalized_vars.metric_value | default('N/A') }}
+          
+          {% if normalized_vars.source == "dynatrace" %}
+          INFORMACIÓN DYNATRACE:
+          Event Type: {{ dynatrace_event_type | default('N/A') }}
+          AWS Region: {{ aws_region | default('N/A') }}
+          AWS AZ: {{ aws_availability_zone | default('N/A') }}
+          AWS Resource: {{ aws_resource_id | default('N/A') }}
+          {% elif normalized_vars.source == "zabbix" %}
+          INFORMACIÓN ZABBIX:
+          Trigger: {{ zabbix_trigger_name | default('N/A') }}
+          Item Key: {{ zabbix_item_key | default('N/A') }}
+          Event ID: {{ zabbix_event_id | default('N/A') }}
+          {% endif %}
+          
+          SERVICIOS WINDOWS VERIFICADOS:
+          - Windows Management Instrumentation (Winmgmt)
+          - Event Log Service (EventLog)
+          - Print Spooler (Spooler)
+          - Background Intelligent Transfer Service (BITS)
+          - DNS Client (Dnscache)
+          - Windows Time (W32Time)
+          - Workstation (LanmanWorkstation)
+          - Server (LanmanServer)
+          
+          ACCIONES DE REMEDIACIÓN EJECUTADAS:
+          - Limpieza de archivos temporales del sistema
+          - Verificación de procesos con alto consumo de recursos
+          - Sincronización de tiempo del sistema
+          - Garbage Collection de memoria (si aplicable)
+          - Verificación de integridad de archivos del sistema (si aplicable)
+          
+          Automatización ejecutada por Ansible AWX
+          Playbook: windows-server-check-universal.yml
+        dest: "/var/log/automation_windows_{{ normalized_vars.source }}_{{ dynatrace_problem_id }}_{{ ansible_date_time.epoch | default('unknown') }}.txt"
+      ignore_errors: yes
+      
+    - name: "Mostrar ubicación del reporte Windows"
+      debug:
+        msg: |
+          📄 ARCHIVO DE REPORTE WINDOWS CREADO:
+          Ubicación: /var/log/automation_windows_{{ normalized_vars.source }}_{{ dynatrace_problem_id }}_{{ ansible_date_time.epoch | default('unknown') }}.txt
+          Fuente: {{ normalized_vars.source | upper }}
+          
+          💡 PARA ACCEDER AL ARCHIVO:
+          sudo cat /var/log/automation_windows_{{ normalized_vars.source }}_{{ dynatrace_problem_id }}_*.txt
+          
+          🔧 CONFIGURACIÓN ADICIONAL REQUERIDA:
+          - Asegurar que WinRM esté habilitado en los servidores Windows objetivo
+          - Configurar credenciales de administrador en AWX
+          - Verificar conectividad en puertos 5985 (HTTP) y 5986 (HTTPS)
+          - Configurar firewall Windows para permitir conexiones WinRM

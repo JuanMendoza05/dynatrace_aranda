@@ -347,8 +347,20 @@
           Caso Aranda: {{ aranda_case_number }}
           
           Host Verificado: {{ zabbix_host_name | default('N/A') }}
+          Host IP: {{ zabbix_host_ip | default('N/A') }}
+          
+          MÉTRICAS VERIFICADAS:
+          CPU Usage Actual: {{ cpu_usage_result.stdout | default('N/A') }}
+          CPU Reportado por Zabbix: {{ zabbix_item_value | default('N/A') }}
+          Memory Usage: {{ memory_usage_result.stdout | default('N/A') }}
+          Disk Usage: {{ disk_usage_result.stdout | default('N/A') }}
+          
+          SERVICIOS CRÍTICOS:
+          {% for service in service_status_results.results %}
+          - {{ service.item }}: {{ service.status.ActiveState | default('UNKNOWN') }}
+          {% endfor %}
           
           Automatización ejecutada por Ansible AWX
-          Playbook: linux-server-check.yml
-        dest: "/tmp/dynatrace_automation_{{ dynatrace_problem_id }}_{{ ansible_date_time.epoch | default('unknown') }}.txt"
+          Playbook: linux-server-check-fixed.yml
+        dest: "/var/log/dynatrace_automation_{{ dynatrace_problem_id }}_{{ ansible_date_time.epoch | default('unknown') }}.txt"
       ignore_errors: yes
