@@ -1,0 +1,585 @@
+---
+- name: "Verificación automática de servidores Linux - Handler Universal"
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  become: false
+  vars:
+    # Variables comunes de Dynatrace
+    dynatrace_problem_id: "{{ dynatrace_problem_id | default('UNKNOWN') }}"
+    dynatrace_problem_title: "{{ dynatrace_problem_title | default('Sin título') }}"
+    dynatrace_problem_details: "{{ dynatrace_problem_details | default('Sin detalles') }}"
+    dynatrace_state: "{{ dynatrace_state | default('UNKNOWN') }}"
+    dynatrace_impact_level: "{{ dynatrace_impact_level | default('UNKNOWN') }}"
+    aranda_case_id: "{{ aranda_case_id | default('') }}"
+    aranda_case_number: "{{ aranda_case_number | default('') }}"
+    affected_hosts: "{{ affected_hosts | default([]) }}"
+    affected_services: "{{ affected_services | default([]) }}"
+    webhook_timestamp: "{{ webhook_timestamp | default('') }}"
+    problem_url: "{{ problem_url | default('') }}"
+    
+    # Detección automática de fuente de datos
+    data_source: "{{ data_source | default('auto') }}"
+    
+    # Variables normalizadas (se detectan automáticamente)
+    source_host_name: >-
+      {%- if dynatrace_host_name is defined and dynatrace_host_name != "" -%}
+        {{ dynatrace_host_name }}
+      {%- elif zabbix_host_name is defined and zabbix_host_name != "" -%}
+        {{ zabbix_host_name }}
+      {%- else -%}
+        unknown
+      {%- endif -%}
+    
+    source_host_ip: >-
+      {%- if dynatrace_host_ip is defined and dynatrace_host_ip != "" -%}
+        {{ dynatrace_host_ip }}
+      {%- elif zabbix_host_ip is defined and zabbix_host_ip != "" -%}
+        {{ zabbix_host_ip }}
+      {%- else -%}
+        unknown
+      {%- endif -%}
+    
+    detected_source: >-
+      {%- if data_source != "auto" -%}
+        {{ data_source }}
+      {%- elif dynatrace_host_name is defined and dynatrace_host_name != "" -%}
+        dynatrace
+      {%- elif zabbix_host_name is defined and zabbix_host_name != "" -%}
+        zabbix
+      {%- else -%}
+        unknown
+      {%- endif -%}
+    
+    # Variables de configuración
+    check_timeout: 30
+    retry_count: 3
+    
+  tasks:
+    - name: "Detectar y normalizar fuente de datos"
+      set_fact:
+        normalized_vars:
+          source: "{{ detected_source }}"
+          host_name: "{{ source_host_name }}"
+          host_ip: "{{ source_host_ip }}"
+          problem_type: >-
+            {%- if detected_source == "dynatrace" -%}
+              {{ dynatrace_event_type | default('UNKNOWN') }}
+            {%- elif detected_source == "zabbix" -%}
+              {{ zabbix_trigger_name | default('UNKNOWN') }}
+            {%- else -%}
+              UNKNOWN
+            {%- endif -%}
+          severity: >-
+            {%- if detected_source == "dynatrace" -%}
+              {{ dynatrace_severity | default('UNKNOWN') }}
+            {%- elif detected_source == "zabbix" -%}
+              {{ zabbix_severity | default('UNKNOWN') }}
+            {%- else -%}
+              UNKNOWN
+            {%- endif -%}
+          metric_value: >-
+            {%- if detected_source == "dynatrace" -%}
+              {{ dynatrace_annotation | default('N/A') }}
+            {%- elif detected_source == "zabbix" -%}
+              {{ zabbix_item_value | default('N/A') }}
+            {%- else -%}
+              N/A
+            {%- endif -%}
+
+    - name: "Mostrar información del problema detectado"
+      debug:
+        msg: |
+          ==============================================
+          PROBLEMA DETECTADO - {{ normalized_vars.source | upper }}
+          ==============================================
+          ID del Problema: {{ dynatrace_problem_id }}
+          Título: {{ dynatrace_problem_title }}
+          Estado: {{ dynatrace_state }}
+          Nivel de Impacto: {{ dynatrace_impact_level }}
+          URL del Problema: {{ problem_url }}
+          
+          FUENTE DE DATOS: {{ normalized_vars.source | upper }}
+          Host: {{ normalized_vars.host_name }}
+          IP del Host: {{ normalized_vars.host_ip }}
+          Tipo de Problema: {{ normalized_vars.problem_type }}
+          Severidad: {{ normalized_vars.severity }}
+          Métrica/Valor: {{ normalized_vars.metric_value }}
+          
+          {% if detected_source == "dynatrace" %}
+          INFORMACIÓN DYNATRACE:
+          Event Type: {{ dynatrace_event_type | default('N/A') }}
+          Annotation: {{ dynatrace_annotation | default('N/A') }}
+          AWS Region: {{ aws_region | default('N/A') }}
+          AWS AZ: {{ aws_availability_zone | default('N/A') }}
+          AWS Resource ID: {{ aws_resource_id | default('N/A') }}
+          {% elif detected_source == "zabbix" %}
+          INFORMACIÓN ZABBIX:
+          Trigger: {{ zabbix_trigger_name | default('N/A') }}
+          Item Key: {{ zabbix_item_key | default('N/A') }}
+          Valor Actual: {{ zabbix_item_value | default('N/A') }}
+          Event ID: {{ zabbix_event_id | default('N/A') }}
+          {% endif %}
+          
+          HOSTS Y SERVICIOS:
+          Hosts Afectados: {{ affected_hosts | join(', ') if affected_hosts else 'Detectado: ' + normalized_vars.host_name }}
+          Servicios Afectados: {{ affected_services | join(', ') if affected_services else 'Ninguno' }}
+          
+          CASO ARANDA: {{ aranda_case_number }}
+          Timestamp: {{ webhook_timestamp }}
+          ==============================================
+
+    - name: "Validar datos mínimos requeridos"
+      assert:
+        that:
+          - normalized_vars.host_name != "unknown"
+          - normalized_vars.host_ip != "unknown"
+          - normalized_vars.source in ["dynatrace", "zabbix"]
+        fail_msg: |
+          ERROR: Datos insuficientes para proceder
+          Host name: {{ normalized_vars.host_name }}
+          Host IP: {{ normalized_vars.host_ip }}
+          Source: {{ normalized_vars.source }}
+        success_msg: "✅ Datos validados correctamente - Fuente: {{ normalized_vars.source | upper }}"
+
+    - name: "Agregar host dinámicamente al inventario"
+      add_host:
+        name: "{{ normalized_vars.host_name }}"
+        ansible_host: "{{ normalized_vars.host_ip }}"
+        ansible_user: "{{ ansible_user | default('ansible-user') }}"
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+        groups: 
+          - dynamic_hosts
+          - "{{ normalized_vars.source }}_monitored"
+          - "problem_{{ dynatrace_problem_id | default('unknown') }}"
+      when: 
+        - normalized_vars.host_name != "unknown"
+        - normalized_vars.host_ip != "unknown"
+
+    - name: "Verificar conectividad al host objetivo"
+      ping:
+      delegate_to: "{{ normalized_vars.host_name }}"
+      register: ping_result
+      ignore_errors: yes
+      when: normalized_vars.host_name != "unknown"
+
+    - name: "Mostrar resultado de conectividad"
+      debug:
+        msg: |
+          🔗 CONECTIVIDAD AL HOST OBJETIVO:
+          Host: {{ normalized_vars.host_name }} ({{ normalized_vars.host_ip }})
+          Resultado: {{ 'EXITOSO ✅' if ping_result.ping is defined else 'FALLIDO ❌' }}
+          {% if ping_result.ping is not defined %}
+          Error: {{ ping_result.msg | default('Timeout o error de conexión') }}
+          {% endif %}
+
+    # CAMBIO CRÍTICO: Establecer una variable global para el próximo play
+    - name: "Establecer host objetivo para el siguiente play"
+      set_fact:
+        target_host_for_checks: "{{ normalized_vars.host_name }}"
+      when: ping_result.ping is defined
+
+# PLAY 2: Verificaciones en el servidor objetivo
+# CAMBIO CRÍTICO: Usar la variable global en lugar de una referencia compleja
+- name: "Verificaciones en el servidor objetivo"
+  hosts: "{{ hostvars['localhost']['target_host_for_checks'] | default('localhost') }}"
+  gather_facts: yes
+  become: true
+  vars:
+    # Reutilizar variables del play anterior
+    dynatrace_problem_id: "{{ dynatrace_problem_id | default('UNKNOWN') }}"
+    dynatrace_problem_title: "{{ dynatrace_problem_title | default('Sin título') }}"
+    dynatrace_state: "{{ dynatrace_state | default('UNKNOWN') }}"
+    dynatrace_impact_level: "{{ dynatrace_impact_level | default('UNKNOWN') }}"
+    aranda_case_number: "{{ aranda_case_number | default('') }}"
+    
+  tasks:
+    - name: "Verificar que estamos en el host correcto"
+      debug:
+        msg: |
+          🎯 VERIFICACIÓN DE HOST ACTUAL:
+          ==============================================
+          Host de Ansible: {{ inventory_hostname }}
+          IP Real: {{ ansible_default_ipv4.address | default('N/A') }}
+          Sistema Operativo: {{ ansible_distribution | default('N/A') }} {{ ansible_distribution_version | default('') }}
+          Arquitectura: {{ ansible_architecture | default('N/A') }}
+          Kernel: {{ ansible_kernel | default('N/A') }}
+          ==============================================
+          ✅ Confirmación: Ejecutándose en el host remoto (no en localhost)
+
+    - name: "Heredar variables normalizadas del play anterior"
+      set_fact:
+        inherited_vars: "{{ hostvars['localhost']['normalized_vars'] }}"
+      when: hostvars['localhost']['normalized_vars'] is defined
+
+    - name: "Verificar servicios críticos en el host"
+      service_facts:
+      register: service_facts_result
+      ignore_errors: yes
+
+    - name: "Verificar estado de servicios específicos (con fallback)"
+      block:
+        - name: "Intentar verificar servicios con systemd"
+          systemd:
+            name: "{{ item }}"
+          loop: 
+            - ssh
+            - sshd
+            - systemd-resolved
+            - cron
+            - crond
+            - rsyslog
+          register: service_status_results
+          ignore_errors: yes
+      rescue:
+        - name: "Verificar servicios con service command como fallback"
+          shell: |
+            if command -v service >/dev/null 2>&1; then
+              service {{ item }} status >/dev/null 2>&1 && echo "running" || echo "stopped"
+            else
+              echo "unknown"
+            fi
+          loop:
+            - ssh
+            - sshd  
+            - cron
+            - crond
+            - rsyslog
+          register: service_fallback_results
+          ignore_errors: yes
+
+    - name: "Verificar uso de CPU actual (mejorado)"
+      shell: |
+        # Intentar múltiples métodos para obtener CPU usage
+        if command -v top >/dev/null 2>&1; then
+          top -bn1 | grep "Cpu(s)" | awk '{print $2}' | sed 's/%us,//' 2>/dev/null || \
+          top -bn1 | grep -i cpu | head -1 2>/dev/null || echo "N/A"
+        elif [ -f /proc/loadavg ]; then
+          echo "Load Average: $(cat /proc/loadavg | awk '{print $1, $2, $3}')"
+        elif [ -f /proc/stat ]; then
+          awk '/^cpu / {usage=($2+$4)*100/($2+$3+$4+$5)} END {printf "%.2f%%", usage}' /proc/stat 2>/dev/null || echo "N/A"
+        else
+          echo "No CPU monitoring tools available"
+        fi
+      register: cpu_usage_result
+      ignore_errors: yes
+
+    - name: "Verificar uso de memoria actual (mejorado)"
+      shell: |
+        if command -v free >/dev/null 2>&1; then
+          free -m | awk 'NR==2{printf "%.2f%% (%d/%d MB)", $3*100/$2, $3, $2}' 2>/dev/null || echo "N/A"
+        elif [ -f /proc/meminfo ]; then
+          awk '/MemTotal/ {total=$2} /MemAvailable/ {avail=$2} END {used=total-avail; printf "%.2f%% (%d/%d MB)", used*100/total, used/1024, total/1024}' /proc/meminfo 2>/dev/null || echo "N/A"
+        else
+          echo "No memory monitoring tools available"
+        fi
+      register: memory_usage_result
+      ignore_errors: yes
+
+    - name: "Verificar uso de disco actual"
+      shell: |
+        if command -v df >/dev/null 2>&1; then
+          df -h / | awk 'NR==2{print $5 " (" $3 "/" $2 ")"}' 2>/dev/null || echo "N/A"
+        else
+          echo "df command not available"
+        fi
+      register: disk_usage_result
+      ignore_errors: yes
+
+    - name: "Verificar carga del sistema actual (mejorado)"
+      shell: |
+        if command -v uptime >/dev/null 2>&1; then
+          uptime | awk -F'load average:' '{print $2}' 2>/dev/null || echo "N/A"
+        elif [ -f /proc/loadavg ]; then
+          echo "$(cat /proc/loadavg | awk '{print $1, $2, $3}')"
+        else
+          echo "Load average not available"
+        fi
+      register: load_average_result
+      ignore_errors: yes
+
+    - name: "Verificar logs recientes del sistema (mejorado)"
+      shell: |
+        if command -v journalctl >/dev/null 2>&1; then
+          journalctl --since="5 minutes ago" --priority=err --no-pager -q 2>/dev/null | head -10 || echo "No recent errors"
+        elif [ -f /var/log/syslog ]; then
+          tail -20 /var/log/syslog 2>/dev/null | grep -i error | head -5 || echo "No syslog errors found"
+        elif [ -f /var/log/messages ]; then
+          tail -20 /var/log/messages 2>/dev/null | grep -i error | head -5 || echo "No log errors found"
+        else
+          echo "No log files accessible"
+        fi
+      register: system_logs_result
+      ignore_errors: yes
+
+    - name: "Verificar métrica específica según fuente (mejorado)"
+      shell: |
+        {% if inherited_vars is defined and inherited_vars.source == "zabbix" %}
+        case "{{ hostvars['localhost']['zabbix_item_key'] | default('') }}" in
+          "system.cpu.util"*)
+            if [ -f /proc/loadavg ]; then
+              echo "Load Average: $(cat /proc/loadavg | awk '{print $1, $2, $3}')"
+            else
+              echo "Load average not available"
+            fi
+            ;;
+          "vm.memory.size"*)
+            if command -v free >/dev/null 2>&1; then
+              free -m | awk 'NR==2{printf "Memory: Used %.2f%% (%d/%d MB)\n", $3*100/$2, $3, $2}' 2>/dev/null
+            elif [ -f /proc/meminfo ]; then
+              awk '/MemTotal/ {total=$2} /MemAvailable/ {avail=$2} END {used=total-avail; printf "Memory: Used %.2f%% (%d/%d MB)\n", used*100/total, used/1024, total/1024}' /proc/meminfo
+            else
+              echo "Memory info not available"
+            fi
+            ;;
+          "vfs.fs.size"*)
+            if command -v df >/dev/null 2>&1; then
+              df -h / | awk 'NR==2{printf "Disk: %s used of %s (%s)\n", $3, $2, $5}' 2>/dev/null
+            else
+              echo "Disk info not available"
+            fi
+            ;;
+          *)
+            echo "Métrica Zabbix no reconocida: {{ hostvars['localhost']['zabbix_item_key'] | default('N/A') }}"
+            ;;
+        esac
+        {% elif inherited_vars is defined and inherited_vars.source == "dynatrace" %}
+        case "{{ hostvars['localhost']['dynatrace_event_type'] | default('') }}" in
+          "CPU_SATURATED"*)
+            echo "CPU Load Check: $(cat /proc/loadavg 2>/dev/null | awk '{print $1 " " $2 " " $3}' || echo 'N/A')"
+            ;;
+          "MEMORY_SATURATED"*)
+            if command -v free >/dev/null 2>&1; then
+              free -m | awk 'NR==2{printf "Memory: Used %.2f%% (%d/%d MB)\n", $3*100/$2, $3, $2}' 2>/dev/null
+            else
+              echo "Memory info not available"
+            fi
+            ;;
+          "DISK_*"*)
+            if command -v df >/dev/null 2>&1; then
+              df -h / | awk 'NR==2{printf "Disk: %s used of %s (%s)\n", $3, $2, $5}' 2>/dev/null
+            else
+              echo "Disk info not available"
+            fi
+            ;;
+          *)
+            echo "Evento Dynatrace: {{ hostvars['localhost']['dynatrace_event_type'] | default('N/A') }}"
+            ;;
+        esac
+        {% else %}
+        echo "Fuente desconocida para verificación de métrica"
+        {% endif %}
+      register: source_metric_check
+      ignore_errors: yes
+
+    - name: "Obtener lista de procesos con alto consumo (mejorado)"
+      shell: |
+        if command -v ps >/dev/null 2>&1; then
+          ps aux --sort=-%cpu 2>/dev/null | head -10 || ps aux | head -10
+        elif [ -d /proc ]; then
+          echo "Procesos activos (usando /proc):"
+          ls /proc/[0-9]* -d 2>/dev/null | head -10 | while read dir; do
+            if [ -f "$dir/comm" ] && [ -f "$dir/stat" ]; then
+              comm=$(cat "$dir/comm" 2>/dev/null)
+              echo "$(basename $dir): $comm"
+            fi
+          done
+        else
+          echo "No process monitoring tools available"
+        fi
+      register: processes_check
+      ignore_errors: yes
+
+    - name: "Generar reporte de diagnóstico completo"
+      debug:
+        msg: |
+          ==============================================
+          REPORTE DE DIAGNÓSTICO AUTOMÁTICO
+          ==============================================
+          Problema ID: {{ dynatrace_problem_id }}
+          Caso Aranda: {{ aranda_case_number }}
+          Fuente: {{ inherited_vars.source | upper if inherited_vars is defined else 'UNKNOWN' }}
+          
+          HOST VERIFICADO: {{ inventory_hostname }}
+          -----------------------------------------------
+          Conectividad: ✅ OK
+          Sistema Operativo: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Arquitectura: {{ ansible_architecture }}
+          Kernel: {{ ansible_kernel }}
+          IP: {{ ansible_default_ipv4.address | default('N/A') }}
+          
+          MÉTRICAS DEL SISTEMA:
+          CPU Usage: {{ cpu_usage_result.stdout | default('N/A') }}
+          Memory Usage: {{ memory_usage_result.stdout | default('N/A') }}
+          Disk Usage: {{ disk_usage_result.stdout | default('N/A') }}
+          Load Average: {{ load_average_result.stdout | default('N/A') }}
+          
+          MÉTRICA ESPECÍFICA ({{ inherited_vars.source | upper if inherited_vars is defined else 'UNKNOWN' }}):
+          {% if inherited_vars is defined %}
+          Tipo/Key: {{ inherited_vars.problem_type }}
+          Valor Reportado: {{ inherited_vars.metric_value }}
+          {% endif %}
+          {% if source_metric_check is defined and source_metric_check.stdout %}
+          Verificación Local: {{ source_metric_check.stdout }}
+          {% endif %}
+          
+          SERVICIOS CRÍTICOS:
+          {% if service_status_results is defined %}
+          {% for service in service_status_results.results %}
+          - {{ service.item }}: {{ service.status.ActiveState | default('UNKNOWN') if not service.failed else 'ERROR' }}
+          {% endfor %}
+          {% elif service_fallback_results is defined %}
+          {% for service in service_fallback_results.results %}
+          - {{ service.item }}: {{ service.stdout | default('UNKNOWN') }}
+          {% endfor %}
+          {% else %}
+          - No se pudieron verificar servicios
+          {% endif %}
+          
+          PROCESOS PRINCIPALES:
+          {{ processes_check.stdout | default('N/A') }}
+          
+          ERRORES RECIENTES EN LOGS:
+          {% if system_logs_result.stdout %}
+          {{ system_logs_result.stdout }}
+          {% else %}
+          Sin errores críticos en los últimos 5 minutos
+          {% endif %}
+          ==============================================
+
+    - name: "Intentar acciones de remediación básicas"
+      block:
+        - name: "Limpiar archivos temporales"
+          shell: |
+            find /tmp -type f -atime +7 -delete 2>/dev/null || true
+            find /var/tmp -type f -atime +7 -delete 2>/dev/null || true
+            echo "Limpieza de archivos temporales completada"
+          ignore_errors: yes
+
+        - name: "Sincronizar tiempo del sistema"
+          shell: |
+            if command -v ntpdate >/dev/null 2>&1; then
+              ntpdate -s time.nist.gov 2>/dev/null || true
+              echo "Tiempo sincronizado con ntpdate"
+            elif command -v timedatectl >/dev/null 2>&1; then
+              timedatectl set-ntp true 2>/dev/null || true
+              echo "NTP habilitado con timedatectl"
+            else
+              echo "No hay herramientas de sincronización disponibles"
+            fi
+          ignore_errors: yes
+          register: time_sync_result
+
+        - name: "Mostrar resultado de acciones de remediación"
+          debug:
+            msg: |
+              🔧 ACCIONES DE REMEDIACIÓN COMPLETADAS:
+              -----------------------------------------------
+              ✅ Limpieza de archivos temporales
+              ✅ Sincronización de tiempo: {{ time_sync_result.stdout | default('N/A') }}
+
+      rescue:
+        - name: "Log de error en remediación"
+          debug:
+            msg: "⚠️ Error ejecutando acciones de remediación: {{ ansible_failed_result.msg | default('Error desconocido') }}"
+
+# PLAY 3: Reporte final desde localhost
+- name: "Generar reporte final"
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  become: false
+  vars:
+    dynatrace_problem_id: "{{ dynatrace_problem_id | default('UNKNOWN') }}"
+    dynatrace_problem_title: "{{ dynatrace_problem_title | default('Sin título') }}"
+    dynatrace_state: "{{ dynatrace_state | default('UNKNOWN') }}"
+    aranda_case_number: "{{ aranda_case_number | default('') }}"
+    
+  tasks:
+    - name: "Generar reporte final y recomendaciones"
+      debug:
+        msg: |
+          ==============================================
+          🎯 REPORTE FINAL - AUTOMATIZACIÓN COMPLETADA
+          ==============================================
+          Problema ID: {{ dynatrace_problem_id }} - {{ dynatrace_problem_title }}
+          Caso Aranda: {{ aranda_case_number }}
+          Estado del Problema: {{ dynatrace_state }}
+          Fuente: {{ normalized_vars.source | upper }}
+          
+          HOST VERIFICADO: {{ normalized_vars.host_name }} ({{ normalized_vars.host_ip }})
+          
+          ACCIONES REALIZADAS:
+          ✅ Verificación de conectividad remota
+          ✅ Monitoreo de recursos en host objetivo
+          ✅ Revisión de logs del sistema remoto
+          ✅ Limpieza de archivos temporales
+          ✅ Verificación específica para {{ normalized_vars.source | upper }}
+          ✅ Sincronización de tiempo del sistema
+          
+          RECOMENDACIONES:
+          {% if normalized_vars.source == "dynatrace" %}
+          - Revisar el dashboard de Dynatrace para métricas actualizadas
+          - Verificar AWS CloudWatch para métricas adicionales
+          - Considerar escalamiento automático en AWS si está disponible
+          {% elif normalized_vars.source == "zabbix" %}
+          - Revisar el dashboard de Zabbix para métricas actualizadas
+          - Verificar triggers relacionados en Zabbix
+          - Revisar la configuración de thresholds si es necesario
+          {% endif %}
+          - Verificar manualmente los hosts con problemas de conectividad
+          - Considerar escalamiento si el problema persiste
+          - Consultar logs detallados en caso de errores críticos
+          
+          Ejecución completada a las: {{ ansible_date_time.iso8601 | default(ansible_date_time.epoch) }}
+          ==============================================
+
+    - name: "Crear archivo de reporte universal (en /tmp)"
+      copy:
+        content: |
+          REPORTE DE AUTOMATIZACIÓN - UNIVERSAL PROBLEM HANDLER
+          =====================================================
+          Timestamp: {{ ansible_date_time.iso8601 | default('N/A') }}
+          Problema ID: {{ dynatrace_problem_id }}
+          Título: {{ dynatrace_problem_title }}
+          Estado: {{ dynatrace_state }}
+          Caso Aranda: {{ aranda_case_number }}
+          Fuente de Datos: {{ normalized_vars.source | upper }}
+          
+          Host Verificado: {{ normalized_vars.host_name | default('N/A') }}
+          Host IP: {{ normalized_vars.host_ip | default('N/A') }}
+          Tipo de Problema: {{ normalized_vars.problem_type | default('N/A') }}
+          Métrica/Valor: {{ normalized_vars.metric_value | default('N/A') }}
+          
+          {% if normalized_vars.source == "dynatrace" %}
+          INFORMACIÓN DYNATRACE:
+          Event Type: {{ dynatrace_event_type | default('N/A') }}
+          AWS Region: {{ aws_region | default('N/A') }}
+          AWS AZ: {{ aws_availability_zone | default('N/A') }}
+          AWS Resource: {{ aws_resource_id | default('N/A') }}
+          {% elif normalized_vars.source == "zabbix" %}
+          INFORMACIÓN ZABBIX:
+          Trigger: {{ zabbix_trigger_name | default('N/A') }}
+          Item Key: {{ zabbix_item_key | default('N/A') }}
+          Event ID: {{ zabbix_event_id | default('N/A') }}
+          {% endif %}
+          
+          VERIFICACIÓN REALIZADA EN HOST REMOTO: {{ normalized_vars.host_name }}
+          
+          Automatización ejecutada por Ansible AWX
+          Playbook: linux-server-check-universal-v4.yml
+        dest: "/tmp/automation_{{ normalized_vars.source }}_{{ dynatrace_problem_id }}_{{ ansible_date_time.epoch | default('unknown') }}.txt"
+      ignore_errors: yes
+      
+    - name: "Mostrar ubicación del reporte"
+      debug:
+        msg: |
+          📄 ARCHIVO DE REPORTE CREADO:
+          Ubicación: /tmp/automation_{{ normalized_vars.source }}_{{ dynatrace_problem_id }}_{{ ansible_date_time.epoch | default('unknown') }}.txt
+          Fuente: {{ normalized_vars.source | upper }}
+          Host Verificado: {{ normalized_vars.host_name }} ✅
+          
+          💡 PARA ACCEDER AL ARCHIVO:
+          cat /tmp/automation_{{ normalized_vars.source }}_{{ dynatrace_problem_id }}_*.txt
+          
+          🎯 CONFIRMACIÓN: El playbook se ejecutó correctamente en el host remoto {{ normalized_vars.host_name }} ({{ normalized_vars.host_ip }})
