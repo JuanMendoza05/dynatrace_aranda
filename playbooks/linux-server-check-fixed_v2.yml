@@ -145,7 +145,7 @@
       add_host:
         name: "{{ normalized_vars.host_name }}"
         ansible_host: "{{ normalized_vars.host_ip }}"
-        ansible_user: root
+        ansible_user: ansible-user
         ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
         groups: 
           - dynamic_hosts
