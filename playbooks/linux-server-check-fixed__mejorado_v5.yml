@@ -1,5 +1,5 @@
 ---
-- name: "Verificación automática de servidores Linux - Handler Universal v5 Mejorado"
+- name: "Verificación automática de servidores Linux - Handler Universal v6 Corregido"
   hosts: localhost
   connection: local
   gather_facts: yes
@@ -62,6 +62,8 @@
           source: "{{ detected_source }}"
           host_name: "{{ source_host_name }}"
           host_ip: "{{ source_host_ip }}"
+          # CAMBIO: Crear un nombre de host válido sin espacios para Ansible
+          ansible_host_name: "{{ source_host_ip | regex_replace('\\.', '-') }}"
           problem_type: >-
             {%- if detected_source == "dynatrace" -%}
               {{ dynatrace_event_type | default('UNKNOWN') }}
@@ -100,7 +102,8 @@
           URL del Problema: {{ problem_url }}
           
           FUENTE DE DATOS: {{ normalized_vars.source | upper }}
-          Host: {{ normalized_vars.host_name }}
+          Host Original: {{ normalized_vars.host_name }}
+          Host Ansible: {{ normalized_vars.ansible_host_name }}
           IP del Host: {{ normalized_vars.host_ip }}
           Tipo de Problema: {{ normalized_vars.problem_type }}
           Severidad: {{ normalized_vars.severity }}
@@ -144,22 +147,25 @@
 
     - name: "Agregar host dinámicamente al inventario con clave SSH"
       add_host:
-        name: "{{ normalized_vars.host_name }}"
+        # CAMBIO: Usar el nombre sin espacios para Ansible
+        name: "{{ normalized_vars.ansible_host_name }}"
         ansible_host: "{{ normalized_vars.host_ip }}"
         ansible_user: "{{ target_ssh_user | default('ansible-user') }}"
         ansible_ssh_private_key_file: "{{ ssh_private_key_path | default('/home/ec2-user/keyPairLNX-Shared.pem') }}"
         ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+        # Variables adicionales para preservar información original
+        original_host_name: "{{ normalized_vars.host_name }}"
         groups: 
           - dynamic_hosts
           - "{{ normalized_vars.source }}_monitored"
-          - "problem_{{ dynatrace_problem_id | default('unknown') }}"
+          - "problem_{{ dynatrace_problem_id | default('unknown') | regex_replace('-', '_') }}"
       when: 
         - normalized_vars.host_name != "unknown"
         - normalized_vars.host_ip != "unknown"
 
     - name: "Verificar conectividad al host objetivo"
       ping:
-      delegate_to: "{{ normalized_vars.host_name }}"
+      delegate_to: "{{ normalized_vars.ansible_host_name }}"
       register: ping_result
       ignore_errors: yes
       when: normalized_vars.host_name != "unknown"
@@ -168,7 +174,8 @@
       debug:
         msg: |
           🔗 CONECTIVIDAD AL HOST OBJETIVO:
-          Host: {{ normalized_vars.host_name }} ({{ normalized_vars.host_ip }})
+          Host Original: {{ normalized_vars.host_name }} 
+          Host Ansible: {{ normalized_vars.ansible_host_name }} ({{ normalized_vars.host_ip }})
           Resultado: {{ 'EXITOSO ✅' if ping_result.ping is defined else 'FALLIDO ❌' }}
           {% if ping_result.ping is not defined %}
           Error: {{ ping_result.msg | default('Timeout o error de conexión') }}
@@ -176,10 +183,11 @@
 
     - name: "Establecer host objetivo para el siguiente play"
       set_fact:
-        target_host_for_checks: "{{ normalized_vars.host_name }}"
+        target_host_for_checks: "{{ normalized_vars.ansible_host_name }}"
       when: ping_result.ping is defined
 
 # PLAY 2: Verificaciones en el servidor objetivo (SIN SUDO)
+# CAMBIO: Usar el nombre de host sin espacios
 - name: "Verificaciones en el servidor objetivo"
   hosts: "{{ hostvars['localhost']['target_host_for_checks'] | default('localhost') }}"
   gather_facts: yes
@@ -199,6 +207,7 @@
           🎯 VERIFICACIÓN DE HOST ACTUAL:
           ==============================================
           Host de Ansible: {{ inventory_hostname }}
+          Host Original: {{ original_host_name | default('N/A') }}
           IP Real: {{ ansible_default_ipv4.address | default('N/A') }}
           Sistema Operativo: {{ ansible_distribution | default('N/A') }} {{ ansible_distribution_version | default('') }}
           Arquitectura: {{ ansible_architecture | default('N/A') }}
@@ -332,20 +341,20 @@
       shell: |
         {% if inherited_vars is defined and inherited_vars.source == "zabbix" %}
         case "{{ hostvars['localhost']['zabbix_item_key'] | default('') }}" in
+          "vm.memory.utilization"*)
+            if command -v free >/dev/null 2>&1; then
+              free -m | awk 'NR==2{printf "Memory Utilization: %.2f%% (%d/%d MB)\n", $3*100/$2, $3, $2}' 2>/dev/null
+            elif [ -f /proc/meminfo ]; then
+              awk '/MemTotal/ {total=$2} /MemAvailable/ {avail=$2} END {used=total-avail; printf "Memory Utilization: %.2f%% (%d/%d MB)\n", used*100/total, used/1024, total/1024}' /proc/meminfo
+            else
+              echo "Memory info not available"
+            fi
+            ;;
           "system.cpu.util"*)
             if [ -f /proc/loadavg ]; then
               echo "Load Average: $(cat /proc/loadavg | awk '{print $1, $2, $3}')"
             else
               echo "Load average not available"
-            fi
-            ;;
-          "vm.memory.size"*)
-            if command -v free >/dev/null 2>&1; then
-              free -m | awk 'NR==2{printf "Memory: Used %.2f%% (%d/%d MB)\n", $3*100/$2, $3, $2}' 2>/dev/null
-            elif [ -f /proc/meminfo ]; then
-              awk '/MemTotal/ {total=$2} /MemAvailable/ {avail=$2} END {used=total-avail; printf "Memory: Used %.2f%% (%d/%d MB)\n", used*100/total, used/1024, total/1024}' /proc/meminfo
-            else
-              echo "Memory info not available"
             fi
             ;;
           "vfs.fs.size"*)
@@ -410,46 +419,6 @@
       register: processes_check
       ignore_errors: yes
 
-    - name: "Verificar datos históricos disponibles"
-      shell: |
-        echo "=== VERIFICACIÓN DE DATOS HISTÓRICOS ==="
-        
-        # Verificar si sar está disponible
-        if command -v sar >/dev/null 2>&1; then
-          echo "SAR disponible - Verificando datos históricos de CPU:"
-          # Intentar obtener datos de CPU de las últimas horas
-          sar -u 1 1 2>/dev/null || echo "No se pudo ejecutar sar"
-          
-          # Verificar si hay archivos de estadísticas
-          if [ -d /var/log/sysstat ] && [ "$(ls -A /var/log/sysstat 2>/dev/null)" ]; then
-            echo "Archivos de estadísticas encontrados en /var/log/sysstat"
-            ls -la /var/log/sysstat/ | head -5
-          else
-            echo "No se encontraron archivos históricos de sysstat"
-          fi
-        else
-          echo "SAR no está disponible"
-        fi
-        
-        # Verificar uptime y última vez que se reinició
-        echo ""
-        echo "INFORMACIÓN DE SISTEMA:"
-        echo "Uptime actual: $(uptime)"
-        echo "Último reinicio: $(who -b 2>/dev/null || echo 'No disponible')"
-        
-        # Verificar si hay archivos de log con timestamps recientes
-        echo ""
-        echo "LOGS DISPONIBLES:"
-        for log_file in /var/log/syslog /var/log/messages /var/log/kern.log; do
-          if [ -r "$log_file" ]; then
-            echo "$log_file: Accesible"
-          else
-            echo "$log_file: No accesible"
-          fi
-        done
-      register: historical_data_result
-      ignore_errors: yes
-
     - name: "Análisis de problema reportado vs estado actual"
       shell: |
         echo "=== ANÁLISIS DE PROBLEMA REPORTADO VS ESTADO ACTUAL ==="
@@ -458,14 +427,53 @@
         echo "Timestamp actual: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo ""
         echo "Estado actual del sistema:"
+        
+        # Para problema de memoria de Zabbix
+        {% if inherited_vars is defined and inherited_vars.source == "zabbix" and 'memory.utilization' in (hostvars['localhost']['zabbix_item_key'] | default('')) %}
+        if command -v free >/dev/null 2>&1; then
+          current_mem_usage=$(free -m | awk 'NR==2{printf "%.2f", $3*100/$2}')
+          echo "Utilización de memoria actual: ${current_mem_usage}%"
+          
+          # Comparar con el valor reportado: {{ inherited_vars.metric_value | regex_replace(' %', '') }}
+          reported_value="{{ inherited_vars.metric_value | regex_replace(' %', '') }}"
+          echo "Valor reportado originalmente: ${reported_value}%"
+          
+          # Análisis simple
+          if command -v bc >/dev/null 2>&1; then
+            if [ "$(echo "$current_mem_usage < 85.0" | bc -l 2>/dev/null)" = "1" ]; then
+              mem_status="NORMAL"
+              conclusion="MEJORADO"
+            else
+              mem_status="ELEVADO"
+              conclusion="PERSISTE"
+            fi
+          else
+            # Fallback sin bc - usar comparación de enteros
+            current_int=$(printf "%.0f" "$current_mem_usage" 2>/dev/null)
+            if [ "$current_int" -lt 85 ]; then
+              mem_status="NORMAL"
+              conclusion="MEJORADO"
+            else
+              mem_status="ELEVADO"
+              conclusion="PERSISTE"
+            fi
+          fi
+          
+          echo "ANÁLISIS: El sistema actualmente tiene utilización de memoria $mem_status"
+          echo "CONCLUSIÓN: El problema parece haberse $conclusion"
+        else
+          echo "No se puede verificar utilización de memoria actual"
+          conclusion="DESCONOCIDO"
+        fi
+        {% else %}
+        # Análisis genérico para otros tipos de problemas
         current_load=$(cat /proc/loadavg | awk '{print $1}')
         echo "Load Average actual: $current_load"
         
-        # Análisis comparativo
         if command -v bc >/dev/null 2>&1; then
           if [ "$(echo "$current_load < 1.0" | bc -l 2>/dev/null)" = "1" ]; then
             load_status="BAJA"
-            conclusion="RESUELTO"
+            conclusion="MEJORADO"
           else
             load_status="ELEVADA"
             conclusion="PERSISTE"
@@ -474,7 +482,7 @@
           # Fallback sin bc
           if [ "$(printf "%.0f" "$current_load" 2>/dev/null)" = "0" ]; then
             load_status="BAJA"
-            conclusion="RESUELTO"
+            conclusion="MEJORADO"
           else
             load_status="ELEVADA"  
             conclusion="PERSISTE"
@@ -483,13 +491,15 @@
         
         echo "ANÁLISIS: El sistema actualmente tiene carga $load_status"
         echo "CONCLUSIÓN: El problema parece haberse $conclusion"
+        {% endif %}
         
-        if [ "$conclusion" = "RESUELTO" ]; then
+        if [ "$conclusion" = "MEJORADO" ]; then
           echo "POSIBLES CAUSAS del problema original:"
           echo "  - Proceso temporal que consumió recursos y ya terminó"
           echo "  - Pico de tráfico que ya disminuyó"
           echo "  - Tarea programada (cron) que ya completó"
           echo "  - Reinicio de servicios que causó pico temporal"
+          echo "  - Limpieza automática de memoria del sistema"
         else
           echo "RECOMENDACIÓN: Investigación inmediata requerida"
         fi
@@ -510,6 +520,7 @@
           Fuente: {{ inherited_vars.source | upper if inherited_vars is defined else 'UNKNOWN' }}
           
           HOST VERIFICADO: {{ inventory_hostname }}
+          Host Original: {{ original_host_name | default('N/A') }}
           -----------------------------------------------
           Conectividad: ✅ OK
           Sistema Operativo: {{ ansible_distribution }} {{ ansible_distribution_version }}
@@ -541,9 +552,6 @@
           
           ANÁLISIS DEL PROBLEMA:
           {{ problem_analysis_result.stdout | default('N/A') }}
-          
-          DATOS HISTÓRICOS:
-          {{ historical_data_result.stdout | default('N/A') }}
           
           LOGS DEL SISTEMA (acceso limitado):
           {% if system_logs_result.stdout %}
@@ -617,6 +625,7 @@
           Modo de ejecución: SIN PRIVILEGIOS SUDO
           
           HOST VERIFICADO: {{ normalized_vars.host_name }} ({{ normalized_vars.host_ip }})
+          Host Ansible: {{ normalized_vars.ansible_host_name }}
           
           ACCIONES REALIZADAS:
           ✅ Verificación de conectividad remota con clave SSH
@@ -633,8 +642,8 @@
           ⚠️ Acceso restringido a métricas del sistema
           
           ANÁLISIS DEL PROBLEMA:
-          {% if 'RESUELTO' in (hostvars[normalized_vars.host_name]['problem_analysis_result']['stdout'] | default('')) %}
-          ✅ PROBLEMA APARENTEMENTE RESUELTO
+          {% if normalized_vars.ansible_host_name in hostvars and 'MEJORADO' in (hostvars[normalized_vars.ansible_host_name]['problem_analysis_result']['stdout'] | default('')) %}
+          ✅ PROBLEMA APARENTEMENTE MEJORADO
           {% else %}
           ⚠️ PROBLEMA PUEDE PERSISTIR
           {% endif %}
@@ -652,7 +661,7 @@
           {% endif %}
           
           PRÓXIMOS PASOS PARA CASO ARANDA {{ aranda_case_number }}:
-          {% if 'RESUELTO' in (hostvars[normalized_vars.host_name]['problem_analysis_result']['stdout'] | default('')) %}
+          {% if normalized_vars.ansible_host_name in hostvars and 'MEJORADO' in (hostvars[normalized_vars.ansible_host_name]['problem_analysis_result']['stdout'] | default('')) %}
           1. ACTUALIZAR CASO: "Problema se resolvió automáticamente"
           2. ADJUNTAR: Este reporte de diagnóstico automático
           3. MONITOREAR: Sistema por 2-4 horas para confirmar estabilidad
@@ -682,7 +691,8 @@
           Fuente de Datos: {{ normalized_vars.source | upper }}
           Modo de Ejecución: SIN PRIVILEGIOS SUDO
           
-          Host Verificado: {{ normalized_vars.host_name | default('N/A') }}
+          Host Original: {{ normalized_vars.host_name | default('N/A') }}
+          Host Ansible: {{ normalized_vars.ansible_host_name | default('N/A') }}
           Host IP: {{ normalized_vars.host_ip | default('N/A') }}
           Tipo de Problema: {{ normalized_vars.problem_type | default('N/A') }}
           Métrica/Valor: {{ normalized_vars.metric_value | default('N/A') }}
@@ -700,12 +710,16 @@
           Event ID: {{ zabbix_event_id | default('N/A') }}
           {% endif %}
           
-          VERIFICACIÓN REALIZADA EN HOST REMOTO: {{ normalized_vars.host_name }}
+          VERIFICACIÓN REALIZADA EN HOST REMOTO: {{ normalized_vars.ansible_host_name }}
           
           CONFIGURACIÓN DE CONEXIÓN:
           - Usuario SSH: {{ target_ssh_user | default('ansible-user') }}
           - Clave privada: {{ ssh_private_key_path | default('/home/ec2-user/keyPairLNX-Shared.pem') }}
           - Modo: Sin privilegios sudo
+          
+          CORRECCIÓN APLICADA:
+          - Nombre de host sin espacios para compatibilidad con Ansible
+          - Host original "{{ normalized_vars.host_name }}" → Host Ansible "{{ normalized_vars.ansible_host_name }}"
           
           LIMITACIONES:
           - Acceso limitado a métricas del sistema
@@ -716,7 +730,7 @@
           Para acceso completo, configurar el usuario ansible-user en sudoers sin contraseña
           
           Automatización ejecutada por Ansible AWX
-          Playbook: linux-server-check-universal-v5-mejorado.yml
+          Playbook: linux-server-check-universal-v6-corregido.yml
         dest: "/tmp/automation_nosudo_{{ normalized_vars.source }}_{{ dynatrace_problem_id }}_{{ ansible_date_time.epoch | default('unknown') }}.txt"
       ignore_errors: yes
       
@@ -726,7 +740,8 @@
           📄 ARCHIVO DE REPORTE CREADO:
           Ubicación: /tmp/automation_nosudo_{{ normalized_vars.source }}_{{ dynatrace_problem_id }}_{{ ansible_date_time.epoch | default('unknown') }}.txt
           Fuente: {{ normalized_vars.source | upper }}
-          Host Verificado: {{ normalized_vars.host_name }} ✅
+          Host Original: {{ normalized_vars.host_name }} ✅
+          Host Ansible: {{ normalized_vars.ansible_host_name }} ✅
           Modo: SIN SUDO ⚠️
           
           💡 PARA ACCEDER AL ARCHIVO:
@@ -736,12 +751,12 @@
           Para habilitar sudo sin contraseña, ejecutar en el host objetivo:
           echo "ansible-user ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/ansible-user
           
-          🎯 CONFIRMACIÓN: El playbook se ejecutó correctamente en el host remoto {{ normalized_vars.host_name }} ({{ normalized_vars.host_ip }})
+          🎯 CONFIRMACIÓN: El playbook se ejecutó correctamente en el host remoto {{ normalized_vars.ansible_host_name }} ({{ normalized_vars.host_ip }})
           ✅ Usando clave SSH: {{ ssh_private_key_path | default('/home/ec2-user/keyPairLNX-Shared.pem') }}
           
           📊 RESUMEN EJECUTIVO:
-          {% if 'RESUELTO' in (hostvars[normalized_vars.host_name]['problem_analysis_result']['stdout'] | default('')) %}
-          - Estado: PROBLEMA APARENTEMENTE RESUELTO ✅
+          {% if normalized_vars.ansible_host_name in hostvars and 'MEJORADO' in (hostvars[normalized_vars.ansible_host_name]['problem_analysis_result']['stdout'] | default('')) %}
+          - Estado: PROBLEMA APARENTEMENTE MEJORADO ✅
           - Acción: MONITOREO PREVENTIVO recomendado
           {% else %}
           - Estado: REQUIERE INVESTIGACIÓN ADICIONAL ⚠️  
@@ -749,3 +764,7 @@
           {% endif %}
           - Diagnóstico: COMPLETO (con limitaciones sin sudo)
           - Conectividad: EXITOSA
+          
+          🔧 CORRECCIÓN APLICADA:
+          ✅ Solucionado problema de nombres de host con espacios
+          ✅ Host "{{ normalized_vars.host_name }}" → "{{ normalized_vars.ansible_host_name }}"
