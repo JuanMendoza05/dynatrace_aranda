@@ -449,9 +449,11 @@
         done
       register: historical_data_result
       ignore_errors: yes
+
+    - name: "Análisis de problema reportado vs estado actual"
       shell: |
         echo "=== ANÁLISIS DE PROBLEMA REPORTADO VS ESTADO ACTUAL ==="
-        echo "Problema original (Zabbix): {{ inherited_vars.metric_value }}% CPU utilization"
+        echo "Problema original ({{ inherited_vars.source }}): {{ inherited_vars.metric_value }}"
         echo "Timestamp del problema: {{ hostvars['localhost']['webhook_timestamp'] | default('No disponible') }}"
         echo "Timestamp actual: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo ""
@@ -460,23 +462,44 @@
         echo "Load Average actual: $current_load"
         
         # Análisis comparativo
-        if [ "$(echo "$current_load < 1.0" | bc -l 2>/dev/null)" = "1" ] || [ "$(printf "%.0f" "$current_load" 2>/dev/null)" = "0" ]; then
-          echo "ANÁLISIS: El sistema actualmente tiene carga BAJA"
-          echo "CONCLUSIÓN: El problema de CPU alta parece haberse RESUELTO"
+        if command -v bc >/dev/null 2>&1; then
+          if [ "$(echo "$current_load < 1.0" | bc -l 2>/dev/null)" = "1" ]; then
+            load_status="BAJA"
+            conclusion="RESUELTO"
+          else
+            load_status="ELEVADA"
+            conclusion="PERSISTE"
+          fi
+        else
+          # Fallback sin bc
+          if [ "$(printf "%.0f" "$current_load" 2>/dev/null)" = "0" ]; then
+            load_status="BAJA"
+            conclusion="RESUELTO"
+          else
+            load_status="ELEVADA"  
+            conclusion="PERSISTE"
+          fi
+        fi
+        
+        echo "ANÁLISIS: El sistema actualmente tiene carga $load_status"
+        echo "CONCLUSIÓN: El problema parece haberse $conclusion"
+        
+        if [ "$conclusion" = "RESUELTO" ]; then
           echo "POSIBLES CAUSAS del problema original:"
-          echo "  - Proceso temporal que consumió CPU y ya terminó"
+          echo "  - Proceso temporal que consumió recursos y ya terminó"
           echo "  - Pico de tráfico que ya disminuyó"
           echo "  - Tarea programada (cron) que ya completó"
           echo "  - Reinicio de servicios que causó pico temporal"
         else
-          echo "ANÁLISIS: El sistema AÚN tiene carga elevada"
-          echo "CONCLUSIÓN: El problema puede PERSISTIR"
+          echo "RECOMENDACIÓN: Investigación inmediata requerida"
         fi
         
         echo ""
         echo "RECOMENDACIÓN: Revisar logs de tiempo del problema original para identificar la causa raíz"
       register: problem_analysis_result
       ignore_errors: yes
+
+    - name: "Generar reporte de diagnóstico completo"
       debug:
         msg: |
           ==============================================
@@ -515,6 +538,12 @@
           
           PROCESOS PRINCIPALES:
           {{ processes_check.stdout | default('N/A') }}
+          
+          ANÁLISIS DEL PROBLEMA:
+          {{ problem_analysis_result.stdout | default('N/A') }}
+          
+          DATOS HISTÓRICOS:
+          {{ historical_data_result.stdout | default('N/A') }}
           
           LOGS DEL SISTEMA (acceso limitado):
           {% if system_logs_result.stdout %}
@@ -596,11 +625,19 @@
           ✅ Limpieza de archivos temporales del usuario
           ✅ Verificación específica para {{ normalized_vars.source | upper }}
           ✅ Análisis de procesos del usuario
+          ✅ Análisis comparativo del problema vs estado actual
           
           LIMITACIONES DEL MODO SIN SUDO:
           ⚠️ Acceso limitado a logs del sistema
           ⚠️ No se pueden consultar todos los servicios
           ⚠️ Acceso restringido a métricas del sistema
+          
+          ANÁLISIS DEL PROBLEMA:
+          {% if 'RESUELTO' in (hostvars[normalized_vars.host_name]['problem_analysis_result']['stdout'] | default('')) %}
+          ✅ PROBLEMA APARENTEMENTE RESUELTO
+          {% else %}
+          ⚠️ PROBLEMA PUEDE PERSISTIR
+          {% endif %}
           
           RECOMENDACIONES ESPECÍFICAS:
           {% if normalized_vars.source == "dynatrace" %}
@@ -614,24 +651,9 @@
           - Considerar ajustar la sensibilidad del trigger si fueron picos temporales normales
           {% endif %}
           
-          ACCIONES RECOMENDADAS BASADAS EN EL ANÁLISIS:
-          {% if "'RESUELTO'" in (problem_analysis_result.stdout | default('')) %}
-          ✅ PROBLEMA APARENTEMENTE RESUELTO:
-          - Monitorear el sistema en las próximas horas para confirmar estabilidad
-          - Revisar si hay patrones horarios (ej: tareas cron, backups, etc.)
-          - Documentar la resolución automática para futura referencia
-          - Considerar ajustar thresholds si son demasiado sensibles
-          {% else %}
-          ⚠️ PROBLEMA PUEDE PERSISTIR:
-          - Investigación inmediata requerida
-          - Verificar procesos en ejecución manualmente
-          - Revisar aplicaciones críticas
-          - Considerar escalamiento a personal técnico
-          {% endif %}
-          
           PRÓXIMOS PASOS PARA CASO ARANDA {{ aranda_case_number }}:
-          {% if "'RESUELTO'" in (hostvars[normalized_vars.host_name]['problem_analysis_result']['stdout'] | default('')) %}
-          1. ACTUALIZAR CASO: "Problema de CPU alta se resolvió automáticamente"
+          {% if 'RESUELTO' in (hostvars[normalized_vars.host_name]['problem_analysis_result']['stdout'] | default('')) %}
+          1. ACTUALIZAR CASO: "Problema se resolvió automáticamente"
           2. ADJUNTAR: Este reporte de diagnóstico automático
           3. MONITOREAR: Sistema por 2-4 horas para confirmar estabilidad
           4. CERRAR: Caso si no hay recurrencia
@@ -643,12 +665,6 @@
           4. IMPLEMENTAR: Acciones correctivas específicas
           5. SEGUIMIENTO: Continuo hasta resolución confirmada
           {% endif %}
-          
-          MEJORAS TÉCNICAS SUGERIDAS:
-          - Configurar sudo sin contraseña para diagnósticos más completos
-          - Instalar herramientas de monitoreo histórico (sysstat/sar)
-          - Implementar alertas proactivas antes de que lleguen a thresholds críticos
-          - Crear scripts de diagnóstico automático más detallados
           
           Ejecución completada a las: {{ ansible_date_time.iso8601 | default(ansible_date_time.epoch) }}
           ==============================================
@@ -724,7 +740,7 @@
           ✅ Usando clave SSH: {{ ssh_private_key_path | default('/home/ec2-user/keyPairLNX-Shared.pem') }}
           
           📊 RESUMEN EJECUTIVO:
-          {% if "'RESUELTO'" in (hostvars[normalized_vars.host_name]['problem_analysis_result']['stdout'] | default('')) %}
+          {% if 'RESUELTO' in (hostvars[normalized_vars.host_name]['problem_analysis_result']['stdout'] | default('')) %}
           - Estado: PROBLEMA APARENTEMENTE RESUELTO ✅
           - Acción: MONITOREO PREVENTIVO recomendado
           {% else %}
