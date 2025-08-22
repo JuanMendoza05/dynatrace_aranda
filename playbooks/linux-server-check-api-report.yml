@@ -19,8 +19,8 @@
     problem_url: "{{ problem_url | default('') }}"
     
     # Configuración del API endpoint
-    api_endpoint: "https://10.100.66.91:5443/ansible/report"
-    api_token: "{{ api_bearer_token | default('XXXXXXXX') }}"
+    api_endpoint: "{{ api_url | default('http://localhost:6000/webhook/ansible') }}"
+    api_token: "{{ api_bearer_token | default('') }}"
     
     # Detección automática de fuente de datos
     data_source: "{{ data_source | default('auto') }}"
@@ -399,7 +399,7 @@
   gather_facts: no
   vars:
     dynatrace_problem_id: "{{ dynatrace_problem_id | default('UNKNOWN') }}"
-    api_endpoint: "https://10.100.66.91:5443/ansible/report"
+    api_endpoint: "{{ api_url | default('http://localhost:6000/webhook/ansible') }}"
     api_token: "{{ api_bearer_token | default('XXXXXXXX') }}"
     
   tasks:
