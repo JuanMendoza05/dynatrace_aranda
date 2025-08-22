@@ -1,0 +1,488 @@
+---
+- name: "Verificación automática de servidores Linux - Handler Universal con API Report"
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  become: false
+  vars:
+    # Variables comunes de Dynatrace
+    dynatrace_problem_id: "{{ dynatrace_problem_id | default('UNKNOWN') }}"
+    dynatrace_problem_title: "{{ dynatrace_problem_title | default('Sin título') }}"
+    dynatrace_problem_details: "{{ dynatrace_problem_details | default('Sin detalles') }}"
+    dynatrace_state: "{{ dynatrace_state | default('UNKNOWN') }}"
+    dynatrace_impact_level: "{{ dynatrace_impact_level | default('UNKNOWN') }}"
+    aranda_case_id: "{{ aranda_case_id | default('') }}"
+    aranda_case_number: "{{ aranda_case_number | default('') }}"
+    affected_hosts: "{{ affected_hosts | default([]) }}"
+    affected_services: "{{ affected_services | default([]) }}"
+    webhook_timestamp: "{{ webhook_timestamp | default('') }}"
+    problem_url: "{{ problem_url | default('') }}"
+    
+    # Configuración del API endpoint
+    api_endpoint: "https://10.100.66.91:5443/ansible/report"
+    api_token: "{{ api_bearer_token | default('XXXXXXXX') }}"
+    
+    # Detección automática de fuente de datos
+    data_source: "{{ data_source | default('auto') }}"
+    
+    # Variables normalizadas (se detectan automáticamente)
+    source_host_name: >-
+      {%- if dynatrace_host_name is defined and dynatrace_host_name != "" -%}
+        {{ dynatrace_host_name }}
+      {%- elif zabbix_host_name is defined and zabbix_host_name != "" -%}
+        {{ zabbix_host_name }}
+      {%- else -%}
+        unknown
+      {%- endif -%}
+    
+    source_host_ip: >-
+      {%- if dynatrace_host_ip is defined and dynatrace_host_ip != "" -%}
+        {{ dynatrace_host_ip }}
+      {%- elif zabbix_host_ip is defined and zabbix_host_ip != "" -%}
+        {{ zabbix_host_ip }}
+      {%- else -%}
+        unknown
+      {%- endif -%}
+    
+    detected_source: >-
+      {%- if data_source != "auto" -%}
+        {{ data_source }}
+      {%- elif dynatrace_host_name is defined and dynatrace_host_name != "" -%}
+        dynatrace
+      {%- elif zabbix_host_name is defined and zabbix_host_name != "" -%}
+        zabbix
+      {%- else -%}
+        unknown
+      {%- endif -%}
+    
+    # Variables de configuración
+    check_timeout: 30
+    retry_count: 3
+    
+  tasks:
+    - name: "Detectar y normalizar fuente de datos"
+      set_fact:
+        normalized_vars:
+          source: "{{ detected_source }}"
+          host_name: "{{ source_host_name }}"
+          host_ip: "{{ source_host_ip }}"
+          # Crear un nombre de host válido sin espacios para Ansible
+          ansible_host_name: "{{ source_host_ip | regex_replace('\\.', '-') }}"
+          problem_type: >-
+            {%- if detected_source == "dynatrace" -%}
+              {{ dynatrace_event_type | default('UNKNOWN') }}
+            {%- elif detected_source == "zabbix" -%}
+              {{ zabbix_trigger_name | default('UNKNOWN') }}
+            {%- else -%}
+              UNKNOWN
+            {%- endif -%}
+          severity: >-
+            {%- if detected_source == "dynatrace" -%}
+              {{ dynatrace_severity | default('UNKNOWN') }}
+            {%- elif detected_source == "zabbix" -%}
+              {{ zabbix_severity | default('UNKNOWN') }}
+            {%- else -%}
+              UNKNOWN
+            {%- endif -%}
+          metric_value: >-
+            {%- if detected_source == "dynatrace" -%}
+              {{ dynatrace_annotation | default('N/A') }}
+            {%- elif detected_source == "zabbix" -%}
+              {{ zabbix_item_value | default('N/A') }}
+            {%- else -%}
+              N/A
+            {%- endif -%}
+
+    - name: "Mostrar información del problema detectado"
+      debug:
+        msg: |
+          ==============================================
+          PROBLEMA DETECTADO - {{ normalized_vars.source | upper }}
+          ==============================================
+          ID del Problema: {{ dynatrace_problem_id }}
+          Título: {{ dynatrace_problem_title }}
+          Estado: {{ dynatrace_state }}
+          Host: {{ normalized_vars.host_name }} ({{ normalized_vars.host_ip }})
+          Fuente: {{ normalized_vars.source | upper }}
+          ==============================================
+
+    - name: "Validar datos mínimos requeridos"
+      assert:
+        that:
+          - normalized_vars.host_name != "unknown"
+          - normalized_vars.host_ip != "unknown"
+          - normalized_vars.source in ["dynatrace", "zabbix"]
+        fail_msg: |
+          ERROR: Datos insuficientes para proceder
+          Host name: {{ normalized_vars.host_name }}
+          Host IP: {{ normalized_vars.host_ip }}
+          Source: {{ normalized_vars.source }}
+        success_msg: "✅ Datos validados correctamente - Fuente: {{ normalized_vars.source | upper }}"
+
+    - name: "Agregar host dinámicamente al inventario con clave SSH"
+      add_host:
+        name: "{{ normalized_vars.ansible_host_name }}"
+        ansible_host: "{{ normalized_vars.host_ip }}"
+        ansible_user: "{{ target_ssh_user | default('ansible-user') }}"
+        ansible_ssh_private_key_file: "{{ ssh_private_key_path | default('/home/ec2-user/keyPairLNX-Shared.pem') }}"
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+        original_host_name: "{{ normalized_vars.host_name }}"
+        groups: 
+          - dynamic_hosts
+          - "{{ normalized_vars.source }}_monitored"
+          - "problem_{{ dynatrace_problem_id | default('unknown') | regex_replace('-', '_') }}"
+      when: 
+        - normalized_vars.host_name != "unknown"
+        - normalized_vars.host_ip != "unknown"
+
+    - name: "Verificar conectividad al host objetivo"
+      ping:
+      delegate_to: "{{ normalized_vars.ansible_host_name }}"
+      register: ping_result
+      ignore_errors: yes
+      when: normalized_vars.host_name != "unknown"
+
+    - name: "Establecer host objetivo para el siguiente play"
+      set_fact:
+        target_host_for_checks: "{{ normalized_vars.ansible_host_name }}"
+        connectivity_status: "{{ 'success' if ping_result.ping is defined else 'failed' }}"
+        connectivity_error: "{{ ping_result.msg | default('') if ping_result.ping is not defined else '' }}"
+      when: normalized_vars.host_name != "unknown"
+
+# PLAY 2: Verificaciones en el servidor objetivo
+- name: "Verificaciones en el servidor objetivo"
+  hosts: "{{ hostvars['localhost']['target_host_for_checks'] | default('localhost') }}"
+  gather_facts: yes
+  become: false
+  vars:
+    dynatrace_problem_id: "{{ dynatrace_problem_id | default('UNKNOWN') }}"
+    dynatrace_problem_title: "{{ dynatrace_problem_title | default('Sin título') }}"
+    dynatrace_state: "{{ dynatrace_state | default('UNKNOWN') }}"
+    aranda_case_number: "{{ aranda_case_number | default('') }}"
+    
+  tasks:
+    - name: "Heredar variables normalizadas del play anterior"
+      set_fact:
+        inherited_vars: "{{ hostvars['localhost']['normalized_vars'] }}"
+      when: hostvars['localhost']['normalized_vars'] is defined
+
+    - name: "Verificar uso de CPU actual (sin sudo) - Mejorado"
+      shell: |
+        echo "=== ANÁLISIS DE CPU ==="
+        if [ -f /proc/loadavg ]; then
+          echo "Load Average: $(cat /proc/loadavg | awk '{print $1, $2, $3}')"
+        fi
+        if [ -f /proc/stat ]; then
+          cpu1=$(awk '/^cpu / {print $2+$3+$4+$5+$6+$7+$8}' /proc/stat)
+          idle1=$(awk '/^cpu / {print $5}' /proc/stat)
+          sleep 1
+          cpu2=$(awk '/^cpu / {print $2+$3+$4+$5+$6+$7+$8}' /proc/stat)
+          idle2=$(awk '/^cpu / {print $5}' /proc/stat)
+          cpu_delta=$((cpu2 - cpu1))
+          idle_delta=$((idle2 - idle1))
+          if [ $cpu_delta -gt 0 ]; then
+            cpu_usage=$((100 * (cpu_delta - idle_delta) / cpu_delta))
+            echo "CPU Usage: ${cpu_usage}%"
+          fi
+        fi
+        if command -v uptime >/dev/null 2>&1; then
+          echo "Uptime: $(uptime)"
+        fi
+      register: cpu_usage_result
+      ignore_errors: yes
+
+    - name: "Verificar uso de memoria actual (sin sudo)"
+      shell: |
+        if command -v free >/dev/null 2>&1; then
+          free -m | awk 'NR==2{printf "%.2f%% (%d/%d MB)", $3*100/$2, $3, $2}' 2>/dev/null || echo "N/A"
+        elif [ -f /proc/meminfo ]; then
+          awk '/MemTotal/ {total=$2} /MemAvailable/ {avail=$2} END {used=total-avail; printf "%.2f%% (%d/%d MB)", used*100/total, used/1024, total/1024}' /proc/meminfo 2>/dev/null || echo "N/A"
+        else
+          echo "No memory monitoring tools available"
+        fi
+      register: memory_usage_result
+      ignore_errors: yes
+
+    - name: "Verificar uso de disco actual (sin sudo)"
+      shell: |
+        if command -v df >/dev/null 2>&1; then
+          df -h / 2>/dev/null | awk 'NR==2{print $5 " (" $3 "/" $2 ")"}' || echo "N/A"
+        else
+          echo "df command not available"
+        fi
+      register: disk_usage_result
+      ignore_errors: yes
+
+    - name: "Verificar logs recientes del sistema (sin sudo)"
+      shell: |
+        if command -v journalctl >/dev/null 2>&1; then
+          journalctl --since="5 minutes ago" --priority=err --no-pager -q 2>/dev/null | head -10 || \
+          journalctl --user --since="5 minutes ago" --no-pager -q 2>/dev/null | head -5 || \
+          echo "Limited log access"
+        elif [ -r /var/log/syslog ]; then
+          tail -20 /var/log/syslog 2>/dev/null | grep -i error | head -5 || echo "No syslog errors"
+        else
+          echo "No accessible log files"
+        fi
+      register: system_logs_result
+      ignore_errors: yes
+
+    - name: "Verificar servicios accesibles sin sudo"
+      shell: |
+        if command -v systemctl >/dev/null 2>&1; then
+          systemctl --user list-units --type=service --state=running 2>/dev/null | head -10 || \
+          systemctl list-units --type=service --state=running --no-pager 2>/dev/null | head -10 || \
+          echo "Limited service access"
+        fi
+        if command -v ps >/dev/null 2>&1; then
+          ps aux | grep "^$(whoami)" | head -5 2>/dev/null || echo "Limited process access"
+        fi
+      register: services_check
+      ignore_errors: yes
+
+    - name: "Verificar métrica específica según fuente"
+      shell: |
+        {% if inherited_vars is defined and inherited_vars.source == "zabbix" %}
+        case "{{ hostvars['localhost']['zabbix_item_key'] | default('') }}" in
+          "vm.memory.utilization"*)
+            if command -v free >/dev/null 2>&1; then
+              free -m | awk 'NR==2{printf "Memory Utilization: %.2f%%", $3*100/$2}' 2>/dev/null
+            fi
+            ;;
+          "system.cpu.util"*)
+            if [ -f /proc/loadavg ]; then
+              echo "Load Average: $(cat /proc/loadavg | awk '{print $1, $2, $3}')"
+            fi
+            ;;
+          *)
+            echo "Métrica Zabbix: {{ hostvars['localhost']['zabbix_item_key'] | default('N/A') }}"
+            ;;
+        esac
+        {% elif inherited_vars is defined and inherited_vars.source == "dynatrace" %}
+        case "{{ hostvars['localhost']['dynatrace_event_type'] | default('') }}" in
+          "CPU_SATURATED"*)
+            echo "CPU Load: $(cat /proc/loadavg 2>/dev/null | awk '{print $1}' || echo 'N/A')"
+            ;;
+          "MEMORY_SATURATED"*)
+            if command -v free >/dev/null 2>&1; then
+              free -m | awk 'NR==2{printf "Memory: %.2f%%", $3*100/$2}' 2>/dev/null
+            fi
+            ;;
+          *)
+            echo "Evento Dynatrace: {{ hostvars['localhost']['dynatrace_event_type'] | default('N/A') }}"
+            ;;
+        esac
+        {% endif %}
+      register: source_metric_check
+      ignore_errors: yes
+
+    - name: "Análisis de problema reportado vs estado actual"
+      shell: |
+        echo "=== ANÁLISIS COMPARATIVO ==="
+        echo "Problema original: {{ inherited_vars.metric_value }}"
+        echo "Timestamp problema: {{ hostvars['localhost']['webhook_timestamp'] | default('No disponible') }}"
+        echo "Timestamp actual: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        
+        {% if inherited_vars is defined and inherited_vars.source == "zabbix" and 'memory.utilization' in (hostvars['localhost']['zabbix_item_key'] | default('')) %}
+        if command -v free >/dev/null 2>&1; then
+          current_mem_usage=$(free -m | awk 'NR==2{printf "%.2f", $3*100/$2}')
+          echo "Memoria actual: ${current_mem_usage}%"
+          current_int=$(printf "%.0f" "$current_mem_usage" 2>/dev/null)
+          if [ "$current_int" -lt 85 ]; then
+            echo "STATUS: MEJORADO"
+          else
+            echo "STATUS: PERSISTE"
+          fi
+        fi
+        {% else %}
+        current_load=$(cat /proc/loadavg | awk '{print $1}')
+        echo "Load actual: $current_load"
+        if [ "$(printf "%.0f" "$current_load" 2>/dev/null)" = "0" ]; then
+          echo "STATUS: MEJORADO"
+        else
+          echo "STATUS: PERSISTE"
+        fi
+        {% endif %}
+      register: problem_analysis_result
+      ignore_errors: yes
+
+    - name: "Obtener lista de procesos principales"
+      shell: |
+        if command -v ps >/dev/null 2>&1; then
+          ps aux --sort=-%cpu 2>/dev/null | head -5
+        fi
+      register: processes_check
+      ignore_errors: yes
+
+    - name: "Ejecutar acciones de remediación básicas"
+      shell: |
+        echo "=== ACCIONES DE REMEDIACIÓN ==="
+        
+        # Limpiar archivos temporales del usuario
+        find ~/tmp -type f -atime +7 -delete 2>/dev/null || true
+        find /tmp -user $(whoami) -type f -atime +7 -delete 2>/dev/null || true
+        echo "✅ Limpieza archivos temporales"
+        
+        # Información adicional del sistema
+        echo "✅ Información del sistema recopilada"
+        echo "Uptime: $(uptime 2>/dev/null || echo 'N/A')"
+        
+        echo "=== REMEDIACIÓN COMPLETADA ==="
+      register: remediation_actions
+      ignore_errors: yes
+
+    - name: "Recopilar todos los datos para API"
+      set_fact:
+        diagnostic_data:
+          execution_info:
+            timestamp: "{{ ansible_date_time.iso8601 | default('N/A') }}"
+            execution_host: "{{ inventory_hostname }}"
+            original_host_name: "{{ original_host_name | default(inherited_vars.host_name) }}"
+            ansible_host_name: "{{ inventory_hostname }}"
+            playbook_version: "linux-server-check-api-report.yml"
+            execution_mode: "no-sudo"
+          
+          alert_data:
+            problem_id: "{{ hostvars['localhost']['dynatrace_problem_id'] | default('UNKNOWN') }}"
+            problem_title: "{{ hostvars['localhost']['dynatrace_problem_title'] | default('Sin título') }}"
+            problem_state: "{{ hostvars['localhost']['dynatrace_state'] | default('UNKNOWN') }}"
+            impact_level: "{{ hostvars['localhost']['dynatrace_impact_level'] | default('UNKNOWN') }}"
+            problem_url: "{{ hostvars['localhost']['problem_url'] | default('') }}"
+            webhook_timestamp: "{{ hostvars['localhost']['webhook_timestamp'] | default('') }}"
+            affected_hosts: "{{ hostvars['localhost']['affected_hosts'] | default([]) }}"
+            affected_services: "{{ hostvars['localhost']['affected_services'] | default([]) }}"
+            data_source: "{{ inherited_vars.source }}"
+            problem_type: "{{ inherited_vars.problem_type }}"
+            severity: "{{ inherited_vars.severity }}"
+            metric_value: "{{ inherited_vars.metric_value }}"
+          
+          ticket_data:
+            aranda_case_id: "{{ hostvars['localhost']['aranda_case_id'] | default('') }}"
+            aranda_case_number: "{{ hostvars['localhost']['aranda_case_number'] | default('') }}"
+          
+          host_info:
+            hostname: "{{ inherited_vars.host_name }}"
+            ip_address: "{{ inherited_vars.host_ip }}"
+            operating_system: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+            architecture: "{{ ansible_architecture }}"
+            kernel: "{{ ansible_kernel }}"
+            connectivity_status: "{{ hostvars['localhost']['connectivity_status'] | default('unknown') }}"
+            connectivity_error: "{{ hostvars['localhost']['connectivity_error'] | default('') }}"
+          
+          system_metrics:
+            cpu_usage: "{{ cpu_usage_result.stdout | default('N/A') }}"
+            memory_usage: "{{ memory_usage_result.stdout | default('N/A') }}"
+            disk_usage: "{{ disk_usage_result.stdout | default('N/A') }}"
+            system_logs: "{{ system_logs_result.stdout | default('N/A') }}"
+            services_status: "{{ services_check.stdout | default('N/A') }}"
+            top_processes: "{{ processes_check.stdout | default('N/A') }}"
+            specific_metric_check: "{{ source_metric_check.stdout | default('N/A') }}"
+          
+          problem_analysis:
+            analysis_result: "{{ problem_analysis_result.stdout | default('N/A') }}"
+            status: "{{ 'IMPROVED' if 'MEJORADO' in problem_analysis_result.stdout else 'PERSISTING' if 'PERSISTE' in problem_analysis_result.stdout else 'UNKNOWN' }}"
+          
+          remediation_actions:
+            actions_performed: "{{ remediation_actions.stdout | default('N/A') }}"
+            cleanup_performed: true
+            system_info_collected: true
+            limited_access_mode: true
+          
+          recommendations:
+            immediate_actions: "{{ ['Monitor system for 2-4 hours', 'Review ' + inherited_vars.source + ' dashboard', 'Update Aranda case with results'] if 'MEJORADO' in problem_analysis_result.stdout else ['Escalate to technical team', 'Perform manual investigation', 'Implement specific corrective actions'] }}"
+            case_status_recommendation: "{{ 'RESOLVED_AUTOMATICALLY' if 'MEJORADO' in problem_analysis_result.stdout else 'REQUIRES_ESCALATION' }}"
+
+# PLAY 3: Enviar datos a API en lugar de generar reporte
+- name: "Enviar datos de diagnóstico a API"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars:
+    dynatrace_problem_id: "{{ dynatrace_problem_id | default('UNKNOWN') }}"
+    api_endpoint: "https://10.100.66.91:5443/ansible/report"
+    api_token: "{{ api_bearer_token | default('XXXXXXXX') }}"
+    
+  tasks:
+    - name: "Preparar payload completo para API"
+      set_fact:
+        api_payload: "{{ hostvars[target_host_for_checks]['diagnostic_data'] | default({}) }}"
+      when: target_host_for_checks is defined
+
+    - name: "Mostrar resumen de datos a enviar"
+      debug:
+        msg: |
+          🚀 PREPARANDO ENVÍO A API
+          ==============================================
+          Endpoint: {{ api_endpoint }}
+          Problem ID: {{ api_payload.alert_data.problem_id | default('N/A') }}
+          Host: {{ api_payload.host_info.hostname | default('N/A') }}
+          Estado: {{ api_payload.problem_analysis.status | default('N/A') }}
+          Caso Aranda: {{ api_payload.ticket_data.aranda_case_number | default('N/A') }}
+          ==============================================
+
+    - name: "Enviar datos de diagnóstico a API endpoint"
+      uri:
+        url: "{{ api_endpoint }}"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body: "{{ api_payload }}"
+        validate_certs: no
+        timeout: 30
+        status_code: [200, 201, 202]
+      register: api_response
+      ignore_errors: yes
+
+    - name: "Mostrar resultado del envío a API"
+      debug:
+        msg: |
+          📡 RESULTADO DEL ENVÍO A API
+          ==============================================
+          Estado: {{ 'EXITOSO ✅' if api_response.status == 200 or api_response.status == 201 or api_response.status == 202 else 'FALLIDO ❌' }}
+          Código de respuesta: {{ api_response.status | default('N/A') }}
+          {% if api_response.status == 200 or api_response.status == 201 or api_response.status == 202 %}
+          Mensaje: Datos enviados correctamente al sistema
+          {% else %}
+          Error: {{ api_response.msg | default('Error desconocido') }}
+          {% endif %}
+          
+          DATOS ENVIADOS:
+          - Problem ID: {{ api_payload.alert_data.problem_id | default('N/A') }}
+          - Host: {{ api_payload.host_info.hostname | default('N/A') }} ({{ api_payload.host_info.ip_address | default('N/A') }})
+          - Estado del problema: {{ api_payload.problem_analysis.status | default('N/A') }}
+          - Caso Aranda: {{ api_payload.ticket_data.aranda_case_number | default('N/A') }}
+          - Timestamp: {{ api_payload.execution_info.timestamp | default('N/A') }}
+          ==============================================
+
+    - name: "Crear respaldo local en caso de fallo de API"
+      copy:
+        content: "{{ api_payload | to_nice_json }}"
+        dest: "/tmp/diagnostic_backup_{{ dynatrace_problem_id }}_{{ ansible_date_time.epoch | default('unknown') }}.json"
+      when: api_response.status != 200 and api_response.status != 201 and api_response.status != 202
+      ignore_errors: yes
+
+    - name: "Mostrar resumen final de ejecución"
+      debug:
+        msg: |
+          🎯 RESUMEN FINAL DE AUTOMATIZACIÓN
+          ==============================================
+          ✅ Diagnóstico completado
+          ✅ Datos recopilados del host remoto
+          {{ '✅ Datos enviados exitosamente a API' if api_response.status == 200 or api_response.status == 201 or api_response.status == 202 else '❌ Error enviando datos a API - Respaldo creado' }}
+          
+          PRÓXIMOS PASOS:
+          {% if api_payload.problem_analysis.status == 'IMPROVED' %}
+          1. ✅ Problema aparentemente resuelto
+          2. 📊 Monitorear sistema por 2-4 horas
+          3. 📝 Actualizar caso Aranda como resuelto
+          {% else %}
+          1. ⚠️ Problema requiere atención adicional
+          2. 🔄 Escalar a equipo técnico
+          3. 🔍 Investigación manual requerida
+          {% endif %}
+          
+          Host verificado: {{ api_payload.host_info.hostname | default('N/A') }}
+          Ejecución completada: {{ ansible_date_time.iso8601 | default('N/A') }}
+          ==============================================
